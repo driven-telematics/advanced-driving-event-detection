@@ -1,9 +1,6 @@
 import math
 from datetime import datetime
 
-"""
-Can you write me a python script that can detect general cornering and hard cornering events? The script will read in driving session data from a file. The driving session data is formatted: "lat,long,distracted,velocity,timestamp,gyro-x,gyro-y,gyro-z,accelerometer-x,accelerometer-y,accelerometer-a|...". A few things to note are each data point is separated by the "|" character and timestamp is in this format - 1746468572. I want you to write me an algorithm that can detect general cornering and hard cornering events from the driving session, and output the type of event (either general cornering and hard cornering), user's location, timestamp it occurred (readable format with hour, min, sec and as well as 1746468572 format), and duration of the event (check for consecutive data points that are considered general cornering and hard cornering events.
-"""
 
 # Thresholds
 BRAKING_THRESHOLD = 9.0   # mph/s
@@ -36,13 +33,6 @@ def parse_data_point(raw):
         "accel_mphs": accel_magnitude_mphs
     }
 
-# def moving_average(values, window_size=5):
-#     smoothed = []
-#     for i in range(len(values)):
-#         window = values[max(0, i - window_size + 1):i + 1]
-#         avg = sum(window) / len(window)
-#         smoothed.append(avg)
-#     return smoothed
 
 def detect_events(data_points):
     events = [] # final lsit of detected events
@@ -125,12 +115,6 @@ with open("test2.txt", "r") as f:
 
 data_strings = raw_data.split('|')
 data_points = [parse_data_point(s) for s in data_strings]
-
-### Smoothing
-# raw_magnitudes = [dp['accel_mphs'] for dp in data_points]
-# smoothed_magnitudes = moving_average(raw_magnitudes)
-# for dp, smoothed_val in zip(data_points, smoothed_magnitudes):
-#     dp['accel_mphs_smoothed'] = smoothed_val
 
 events = detect_events(data_points)
 print_events(events)
