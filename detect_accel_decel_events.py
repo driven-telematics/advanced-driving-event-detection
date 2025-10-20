@@ -1,11 +1,6 @@
 import math
 from datetime import datetime
 
-
-# Thresholds
-BRAKING_THRESHOLD = 9.0   # mph/s
-ACCEL_THRESHOLD = 7.0     # mph/s
-
 def g_to_mphs(g_val): # G -> mph/s
     return g_val * 9.81 * 2.237
 
@@ -33,10 +28,13 @@ def parse_data_point(raw):
         "accel_mphs": accel_magnitude_mphs
     }
 
-
-def detect_events(data_points):
-    events = [] # final lsit of detected events
+def detect_events(data_points, config):
+    events = [] # final list of detected events
     current_event = None # tracking of current ongoing event
+    
+    # Get config values with defaults
+    braking_threshold = config.get('BRAKING_THRESHOLD', 8.0)
+    accel_threshold = config.get('ACCEL_THRESHOLD', 9.0)
 
     for i in range(1, len(data_points)):
         prev = data_points[i - 1]
@@ -46,9 +44,8 @@ def detect_events(data_points):
             continue
 
         vel_change = curr['velocity'] - prev['velocity']
-        prev_accel = prev['accel_mphs']
         curr_accel = curr['accel_mphs']
-        diff_accel = curr_accel - prev_accel
+        diff_accel = curr_accel - prev['accel_mphs']
         
         """
         A hard braking event is when:
@@ -61,9 +58,9 @@ def detect_events(data_points):
 
         - Events are ignored below 15 mph
         """
-        if curr_accel > BRAKING_THRESHOLD and vel_change < 0 and curr['velocity'] > 15 and diff_accel > BRAKING_THRESHOLD:
+        if curr_accel > braking_threshold and vel_change < 0 and curr['velocity'] > 15 and diff_accel > braking_threshold:
             event_type = "Hard Braking"
-        elif curr_accel > ACCEL_THRESHOLD and vel_change > 0 and curr['velocity'] > 15 and diff_accel > ACCEL_THRESHOLD:
+        elif curr_accel > accel_threshold and vel_change > 0 and curr['velocity'] > 15 and diff_accel > accel_threshold:
             event_type = "Hard Acceleration"
         else:
             event_type = None
@@ -109,14 +106,32 @@ def print_events(events):
         print(f"  Max Acceleration Magnitude: {e['max_accel']:.2f} mph/s")
         print("")
 
-# --- Script Execution ---
-with open("test2.txt", "r") as f:
-    raw_data = f.read().strip()
+def detect_accel_decel_events_wrapper(input_file, config=None):
+    """
+    Main function to detect acceleration/deceleration events from a given input file.
+    
+    Args:
+        input_file (str): Path to the input file containing driving data
+        config (dict): Configuration dictionary containing thresholds and settings
+        
+    Returns:
+        list: List of detected acceleration/deceleration events
+    """
+    if config is None:
+        config = {}
+        
+    with open(input_file, "r") as f:
+        raw_data = f.read().strip()
 
-data_strings = raw_data.split('|')
-data_points = [parse_data_point(s) for s in data_strings]
+    data_strings = raw_data.split('|')
+    data_points = [parse_data_point(s) for s in data_strings]
+    data_points = [point for point in data_points if point is not None]
+    
+    return detect_events(data_points, config)
 
-events = detect_events(data_points)
-print_events(events)
-print(f" Total Number of Events Detected: {len(events)}")
-print(f" Data Points Processed: {len(data_points)}")
+if __name__ == "__main__":
+    # Run the script with an example file
+    events = detect_accel_decel_events_wrapper("test2.txt")
+    print_events(events)
+    print(f" Total Number of Events Detected: {len(events)}")
+    print(f" Data Points Processed: {len([p for p in events if p is not None])}")
