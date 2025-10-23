@@ -150,8 +150,8 @@ def create_new_user_segment_record(segment_id, user_id, road_segment_data):
     current_timestamp = int(time.time())
     current_date = datetime.fromtimestamp(current_timestamp, tz=timezone.utc).strftime('%Y-%m-%d')
     
-    # Calculate TTL: current time + 21 days
-    ttl_timestamp = current_timestamp + (21 * 24 * 60 * 60)
+    # ttl_timestamp = current_timestamp + (21 * 24 * 60 * 60)
+    ttl_timestamp = current_timestamp + (24 * 60 * 60) # Testing - set to 1 day TTL
     
     new_record = {
         "PutRequest": {
@@ -188,7 +188,6 @@ def check_and_update_user_segment_history(travelled_segments, user_id, config):
     """
     # Get unique segment IDs from current trip
     current_trip_segments = list(travelled_segments.keys())
-    print(current_trip_segments)
     
     if not current_trip_segments:
         return {
@@ -233,6 +232,44 @@ def check_and_update_user_segment_history(travelled_segments, user_id, config):
         'segments_not_driven_recently_ids': segments_not_driven_recently
     }
 
+def determine_road_types_travelled(travelled_segments, config):
+    """
+    Determine how many times each road classification type was travelled.
+
+    Args:
+        travelled_segments (dict): A dictionary of segments, where each value contains at least a 'road_type' key.
+        config (dict): Configuration containing 'ROAD_CLASSIFICATIONS' (list of valid road types).
+
+    Returns:
+        dict: A dictionary where each road classification type is a key,
+              with counts of how many times that type was travelled,
+              plus a total under 'road_types_travelled_count'.
+    """
+    # Get the list of valid road classification types
+    road_classifications = config.get('ROAD_CLASSIFICATIONS', [])
+    road_classifications = [road_type.lower() for road_type in road_classifications]
+
+    # Initialize counts for each road classification
+    road_types_travelled = {road_type: 0 for road_type in road_classifications}
+    road_types_travelled['road_types_travelled_count'] = 0
+
+    # Iterate over all segments
+    for segment in travelled_segments.values():
+        road_type = segment.get('road_type')
+
+        # Only count recognized classifications
+        if road_type in road_types_travelled:
+            road_types_travelled[road_type] += 1
+
+    # Compute the total count
+    total_count = sum(
+        count for key, count in road_types_travelled.items()
+        if key != 'road_types_travelled_count'
+    )
+    road_types_travelled['road_types_travelled_count'] = total_count
+
+    return road_types_travelled
+
 def write_speed_data_to_file(file_path, lat, lon, distracted, traveling_speed,
                             osm_speed_limit, mapillary_speed_limit, mapquest_speed_limit, highway_type, timestamp):
 
@@ -260,10 +297,6 @@ def count_segment_occurrences(geocode_to_segment):
     removed_segment_count = {seg_id: count for seg_id, count in segment_count.items() if count < 5}
 
     return filtered_segment_count, removed_segment_count, len(segment_count)
-
-def convert_timestamp(timestamp):
-    timestamp = int(timestamp)
-    return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
 
 def convert_to_lat_lon(coords):
     return [(entry['lat'], entry['lon']) for entry in coords]
@@ -505,36 +538,6 @@ def get_mapquest_speed_limit(coord, config):
             return "Unexpected response format from API."
     else:
         return f"Error: {response.status_code} - {response.text}"                    
-
-
-def calculate_distance_and_duration(coords):
-    """
-    Calculate total distance (in miles) and duration (in seconds) from GPS data.
-    
-    :param coords: List of tuples [(lat, lon, distracted, speed, timestamp), ...]
-    :return: Total distance (miles), total duration (seconds)
-    """
-    if len(coords) < 2:
-        return 0, 0  # Not enough data points
-
-    # Extract relevant fields and sort by timestamp
-    parsed_data = [(lat, lon, datetime.fromtimestamp(int(timestamp), tz=timezone.utc)) for lat, lon, _, _, timestamp in coords]
-    parsed_data.sort(key=lambda x: x[2])  # Sort by timestamp (if not already sorted)
-
-    total_distance = 0
-    start_time = parsed_data[0][2]
-    end_time = parsed_data[-1][2]
-
-    for i in range(1, len(parsed_data)):
-        point1 = (parsed_data[i - 1][0], parsed_data[i - 1][1])
-        point2 = (parsed_data[i][0], parsed_data[i][1])
-        total_distance += geodesic(point1, point2).miles  # Compute great-circle distance
-
-    total_seconds = int((end_time - start_time).total_seconds())  # Convert to int
-    minutes = total_seconds // 60
-    seconds = total_seconds % 60
-
-    return total_distance, (minutes, seconds)
                 
 
 def convert_points_for_speeding_events(geocode_to_segment, travelled_segments):
@@ -609,8 +612,15 @@ def process_data_file(input_file, config):
     reading_file_end_time = time.time()
     elapsed_reading_file_time = reading_file_end_time - reading_file_start_time
     
+
     mapillary_api_call_start_time = time.time()
+    # DEV NOTE: Might need to batch this call if too big of bounding box
     speed_signs = get_mapillary_speed_limits(session_lat_min, session_lon_min, session_lat_max, session_lon_max, config)
+
+    mapillary_api_call_end_time = time.time()
+    elapsed_mapillary_api_call_time = mapillary_api_call_end_time - mapillary_api_call_start_time
+
+
     # Track unique travelled segments across all batches
     travelled_segments = {}
     geocode_to_segment = {}
@@ -618,9 +628,6 @@ def process_data_file(input_file, config):
     batch_start = 0
     osm_api_call = 0
     batch_size = config.get('BATCH_SIZE', 20)
-
-    mapillary_api_call_end_time = time.time()
-    elapsed_mapillary_api_call_time = mapillary_api_call_end_time - mapillary_api_call_start_time
 
     determine_travelled_segments_start_time = time.time()
     while batch_start < total_points:
@@ -660,6 +667,8 @@ def process_data_file(input_file, config):
 
     road_history_end_time = time.time()
     elapsed_road_history_time = road_history_end_time - road_history_start_time
+
+    road_types_travelled = determine_road_types_travelled(travelled_segments, config)
 
     determine_travelled_segments_end_time = time.time()
     elapsed_determine_travelled_segments = determine_travelled_segments_end_time - determine_travelled_segments_start_time
@@ -784,7 +793,6 @@ def process_data_file(input_file, config):
     if speeding_records:
         batch_write_all(config.get('DYNAMODB_SPEEDING_EVENTS_TABLE', 'users_speeding_events'), speeding_records, config)
 
-    distance, (duration_minutes, duration_seconds) = calculate_distance_and_duration(points)
 
     final_output_functionality_end_time = time.time()
     elapsed_final_output_functionality_time = final_output_functionality_end_time - final_output_functionality_start_time
@@ -793,13 +801,12 @@ def process_data_file(input_file, config):
     elapsed_algo_time = algo_end_time - algo_start_time
 
     return {
-        'distance': distance,
-        'duration': (duration_minutes, duration_seconds),
         'speeding_records': speeding_records,
         'grouped_events': grouped_events,
         'geocode_to_segment': geocode_to_segment,
         'travelled_segments': travelled_segments,
         'road_history_stats': history_stats,
+        'road_types_travelled': road_types_travelled,
         'metrics': {
             'user_geocodes': len(points),
             'travelled_segments': len(travelled_segments),

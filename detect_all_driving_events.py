@@ -1,14 +1,17 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import argparse
 import concurrent.futures
 import time
 import os
+import json
+from geopy.distance import geodesic
+from datetime import datetime
 from dotenv import load_dotenv
-from detect_speeding_events import detect_speeding_records, convert_timestamp
+from detect_speeding_events import detect_speeding_records
 from detect_cornering_events import detect_cornering_events_wrapper
 from detect_accel_decel_events import detect_accel_decel_events_wrapper
 from detect_distracted_events import detect_distracted_events
-from detect_late_night_events import detect_late_night_events_wrapper
+from detect_night_driving_events import detect_night_driving_events_wrapper
 from decimal import Decimal
 
 # Load environment variables from .env file
@@ -34,8 +37,13 @@ def get_config():
         'DYNAMODB_ROAD_SEGMENT_TABLE': os.environ.get('DYNAMODB_ROAD_SEGMENT_TABLE', 'drivenDB_road_segment_info'),
         'DYNAMODB_SPEEDING_EVENTS_TABLE': os.environ.get('DYNAMODB_SPEEDING_EVENTS_TABLE', 'users_speeding_events'),
         'USER_ID': int(os.environ.get('USER_ID', '31399')),  # Example user ID for testing
+
+        # Speeding Events
         'EXCESS_SPEED_THRESHOLD_MPH': int(os.environ.get('EXCESS_SPEED_THRESHOLD_MPH', '11')),
         'EXCESS_SPEED_DURATION_SECONDS': int(os.environ.get('EXCESS_SPEED_DURATION_SECONDS', '5')),
+
+        # Road Types
+        'ROAD_CLASSIFICATIONS': os.environ.get('ROAD_CLASSIFICATIONS', '').split(','),
 
         # Cornering Events
         'GENERAL_TURN_THRESHOLD_DEG_S': float(os.environ.get('GENERAL_TURN_THRESHOLD_DEG_S', '15')),
@@ -52,9 +60,127 @@ def get_config():
         # Distracted Events
         'DISTRACTED_MIN_DURATION_SECONDS': int(os.environ.get('DISTRACTED_MIN_DURATION_SECONDS', '5')),
         'DISTRACTED_MIN_SPEED_MPH': float(os.environ.get('DISTRACTED_MIN_SPEED_MPH', '10.0')),
+
+        # Event Detection Toggles
+        'ENABLE_SPEEDING': os.environ.get('ENABLE_SPEEDING', 'true').lower() == 'true',
+        'ENABLE_ROAD_FAMILIARITY': os.environ.get('ENABLE_ROAD_FAMILIARITY', 'true').lower() == 'true',
+        'ENABLE_CORNERING': os.environ.get('ENABLE_CORNERING', 'true').lower() == 'true',
+        'ENABLE_HARD_BRAKING': os.environ.get('ENABLE_HARD_BRAKING', 'true').lower() == 'true',
+        'ENABLE_RAPID_ACCELERATION': os.environ.get('ENABLE_RAPID_ACCELERATION', 'true').lower() == 'true',
+        'ENABLE_DISTRACTED': os.environ.get('ENABLE_DISTRACTED', 'true').lower() == 'true',
+        'ENABLE_NIGHT_DRIVING': os.environ.get('ENABLE_NIGHT_DRIVING', 'true').lower() == 'true',
+        'ENABLE_ROAD_TYPES': os.environ.get('ENABLE_ROAD_TYPES', 'true').lower() == 'true',
+
+        
+        # Trip Summary Configuration
+        'ACCOUNT_ID': os.environ.get('ACCOUNT_ID', '19857054769'),
+        'UTC_OFFSET': os.environ.get('UTC_OFFSET', '-04:00:00'),
+        'CLASSIFICATION': os.environ.get('CLASSIFICATION', 'car'),
+        'DRIVE_ID': os.environ.get('DRIVE_ID', '20251021/12300_12300_00001'),
+        'DEVICE_ID': os.environ.get('DEVICE_ID', 'CEE06157DECA4099'),
     }
     
     return config
+
+def parse_points(input_file):
+    """
+    Parse the input file into a list of points with distracted, timestamp, etc.
+    Returns a list of dicts with keys: lat, lon, distracted, speed, timestamp
+    """
+    points = []
+    with open(input_file, "r") as file:
+        data = file.read().strip().split("|")
+        for row in data:
+            if not row:
+                continue
+            parts = row.split(",")
+            if len(parts) < 5:
+                continue
+            lat = float(parts[0])
+            lon = float(parts[1])
+            distracted = int(parts[2])
+            speed = float(parts[3])
+            timestamp = int(parts[4])
+            points.append({
+                'lat': lat,
+                'lon': lon,
+                'distracted': distracted,
+                'speed': speed,
+                'timestamp': timestamp
+            })
+    return points
+
+def convert_timestamp(timestamp, format):
+    timestamp = int(timestamp)
+    if format == 'strftime':
+        return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    elif format == 'datetime':
+        return datetime.fromtimestamp(timestamp).isoformat() + "Z"
+
+def calculate_distance_and_duration(points):
+    """
+    Calculate total distance (in miles) and duration (in seconds) from GPS data.
+    
+    :param points: List of tuples [(lat, lon, distracted, speed, timestamp), ...]
+    :return: Total distance (miles), total duration (seconds)
+    """
+    if len(points) < 2:
+        return 0, 0  # Not enough data points
+
+    # Extract relevant fields and sort by timestamp
+    parsed_data = [(p['lat'], p['lon'], p['distracted'], p['speed'], p['timestamp']) for p in points]
+    parsed_data.sort(key=lambda x: x[4])  # Sort by timestamp (if not already sorted)
+
+    total_distance = 0
+    start_time = parsed_data[0][4]
+    end_time = parsed_data[-1][4]
+
+    for i in range(1, len(parsed_data)):
+        point1 = (parsed_data[i - 1][0], parsed_data[i - 1][1])
+        point2 = (parsed_data[i][0], parsed_data[i][1])
+        total_distance += geodesic(point1, point2).miles  # Compute great-circle distance
+
+    total_seconds = end_time - start_time
+    # minutes = total_seconds // 60
+    # seconds = total_seconds % 60
+
+    return total_distance, total_seconds
+
+def determine_events_to_process(config):
+    """
+    Determine which events to process based on configuration flags.
+    
+    Args:
+        config (dict): Configuration dictionary
+        
+    Returns:
+        tuple: (events_to_process_list, enabled_events_dict)
+    """
+    enabled_events = {
+        'speeding': config.get('ENABLE_SPEEDING', True),
+        'road_familiarity': config.get('ENABLE_ROAD_FAMILIARITY', True),
+        'road_types': config.get('ENABLE_ROAD_TYPES', True),
+        'cornering': config.get('ENABLE_CORNERING', True),
+        'hard_braking': config.get('ENABLE_HARD_BRAKING', True),
+        'rapid_acceleration': config.get('ENABLE_RAPID_ACCELERATION', True),
+        'distracted': config.get('ENABLE_DISTRACTED', True),
+        'night_driving': config.get('ENABLE_NIGHT_DRIVING', True),
+    }
+    
+    # Convert to list of enabled events for processing
+    events_to_process = []
+    if enabled_events['speeding']:
+        events_to_process.append('speeding')
+    if enabled_events['cornering']:
+        events_to_process.append('cornering')
+    if enabled_events['hard_braking'] or enabled_events['rapid_acceleration']:
+        events_to_process.append('accel_decel')
+    if enabled_events['distracted']:
+        events_to_process.append('distracted')
+    if enabled_events['night_driving']:
+        events_to_process.append('night_driving')
+    
+    return events_to_process, enabled_events
 
 def print_speeding_records(results):
     """
@@ -87,7 +213,7 @@ def print_speeding_records(results):
             else 0
         )
 
-        print(f"⏱️  Timestamp: {convert_timestamp(timestamp)}")
+        print(f"⏱️  Timestamp: {convert_timestamp(timestamp, 'strftime')}")
         print(f"📍 Location: {lat}, {lon}")
         print(f"📏  Distance from Driver to Nearest Road: {distance_meters} m")
         print(f"🚧 Road Segment ID: {segment['id'] if segment else 'None'}")
@@ -101,8 +227,6 @@ def print_speeding_records(results):
     # Print metrics
     metrics = results.get('metrics', {})
     print("======= SPEEDING RECORDS METRICS =======")
-    print(f"Total Distance: {results['distance']:.2f} miles")
-    print(f"Total Duration: {results['duration'][0]} minutes and {results['duration'][1]} seconds")
     print(f"# of User Geocodes: {metrics.get('user_geocodes', 0)}")
     print(f"# of travelled road segments: {metrics.get('travelled_segments', 0)}")
     print(f"# of Unique Segments: {metrics.get('unique_segments', 0)}")
@@ -186,27 +310,26 @@ def print_distracted_events(distracted_events):
     for i, event in enumerate(distracted_events, 1):
         print(f"Event {i}: Start idx {event['start_idx']}, End idx {event['end_idx']}, Start time {event['start_time']}, End time {event['end_time']}, Length {event['length']}")
 
-def print_late_night_events(late_night_results):
+def print_night_driving_events(night_driving_results):
     """
-    Print late night driving events in a formatted way.
+    Print night driving events in a formatted way.
     
     Args:
-        late_night_results (dict): Results from late night events detection
+        night_driving_results (dict): Results from night events detection
     """
-    if 'error' in late_night_results:
-        print(f"Error in late night detection: {late_night_results['error']}")
+    if 'error' in night_driving_results:
+        print(f"Error in night driving detection: {night_driving_results['error']}")
         return
         
     print("\n" + "="*50)
-    print("LATE NIGHT DRIVING EVENTS (12 AM - 4 AM)")
+    print("NIGHT DRIVING EVENTS (12 AM - 4 AM)")
     print("="*50)
-    print(f"Timezone: {late_night_results['timezone_used']}")
-    print(f"Total Late Night Driving Time: {late_night_results['total_late_night_seconds']} seconds")
-    print(f"Total Late Night Driving Time: {late_night_results['total_late_night_minutes']} minutes")
-    print(f"Total Late Night Driving Time: {late_night_results['total_late_night_hours']} hours")
-    print(f"Total Points in Dataset: {late_night_results['total_points']}")
-    print(f"Points During Late Night Hours: {late_night_results['late_night_points']}")
-    print(f"Percentage of Points During Late Night: {late_night_results['late_night_percentage']}%")
+    print(f"Timezone: {night_driving_results['timezone_used']}")
+    print(f"Total Night Driving Time: {night_driving_results['total_night_driving_seconds']} seconds")
+    print(f"Total Night Driving Time: {night_driving_results['total_night_driving_minutes']} minutes")
+    print(f"Total Night Driving Time: {night_driving_results['total_night_driving_hours']} hours")
+    print(f"Points During Night Hours: {night_driving_results['night_driving_points']}")
+    print(f"Percentage of Points During Night: {night_driving_results['night_driving_percentage']}%")
 
 def print_road_history_stats(road_history_stats):
     """
@@ -215,10 +338,11 @@ def print_road_history_stats(road_history_stats):
     Args:
         road_history_stats (dict): Results from road segment history tracking
     """
+
     if 'error' in road_history_stats:
         print(f"Error in road history tracking: {road_history_stats['error']}")
         return
-        
+
     print("\n" + "="*50)
     print("ROAD SEGMENT HISTORY TRACKING (21-DAY WINDOW)")
     print("="*50)
@@ -238,9 +362,38 @@ def print_road_history_stats(road_history_stats):
         print(f"Recently Driven Segment IDs: {len(road_history_stats['segments_driven_recently_ids'])} segments (too many to display)")
     
     if 'segments_not_driven_recently_ids' in road_history_stats and road_history_stats['segments_not_driven_recently'] <= 10:
-        print(f"New/Expired Segment IDs: {road_history_stats['segments_not_driven_recently_ids']}")
+        print(f"New Segment IDs: {road_history_stats['segments_not_driven_recently_ids']}")
     elif 'segments_not_driven_recently_ids' in road_history_stats:
-        print(f"New/Expired Segment IDs: {len(road_history_stats['segments_not_driven_recently_ids'])} segments (too many to display)")
+        print(f"New Segment IDs: {len(road_history_stats['segments_not_driven_recently_ids'])} segments (too many to display)")
+
+def print_road_types_travelled(road_types_travelled):
+    """
+    Print road type statistics in a formatted way.
+    
+    Args:
+        road_types_travelled (dict): Results from road type tracking
+    """
+
+    if 'error' in road_types_travelled:
+        print(f"Error in road type tracking: {road_types_travelled['error']}")
+        return
+
+    print("\n" + "="*50)
+    print("ROAD TYPES TRAVELLED")
+    print("="*50)
+    # Extract total count if present
+    total_count = road_types_travelled.get('road_types_travelled_count', 0)
+
+    # Print each road type count, excluding the total key
+    for road_type, count in sorted(road_types_travelled.items()):
+        if road_type == 'road_types_travelled_count':
+            continue
+        print(f"{road_type:<25} : {count}")
+
+    print("-" * 50)
+    print(f"{'TOTAL':<25} : {total_count}")
+    print("=" * 50 + "\n")
+    
 
 def run_speeding_detection(input_file):
     """
@@ -278,18 +431,30 @@ def run_cornering_detection(input_file):
 
 def run_accel_decel_detection(input_file):
     """
-    Wrapper function for acceleration/deceleration detection to be used with ThreadPoolExecutor.
+    Wrapper function for acceleration/deceleration detection with individual toggles.
     
     Args:
         input_file (str): Path to the input file
+        config (dict): Configuration dictionary
+        enabled_events (dict): Dictionary of enabled events
         
     Returns:
         tuple: (event_type, results)
     """
     try:
         config = get_config()
-        results = detect_accel_decel_events_wrapper(input_file, config=config)
-        return ('accel_decel', results)
+        # Get all accel/decel events
+        all_events = detect_accel_decel_events_wrapper(input_file, config=config)
+        
+        # Filter based on enabled events
+        filtered_events = []
+        for event in all_events:
+            if event['type'] == 'Hard Braking' and config.get('hard_braking', True):
+                filtered_events.append(event)
+            elif event['type'] == 'Rapid Acceleration' and config.get('rapid_acceleration', True):
+                filtered_events.append(event)
+        
+        return ('accel_decel', filtered_events)
     except Exception as e:
         return ('accel_decel', {'error': str(e)})
 
@@ -310,9 +475,9 @@ def run_distracted_detection(input_file, config=None):
     except Exception as e:
         return ('distracted', {'error': str(e)})
 
-def run_late_night_detection(input_file):
+def run_night_driving_detection(input_file):
     """
-    Wrapper function for late night detection to be used with ThreadPoolExecutor.
+    Wrapper function for night_driving detection to be used with ThreadPoolExecutor.
     
     Args:
         input_file (str): Path to the input file
@@ -322,10 +487,10 @@ def run_late_night_detection(input_file):
     """
     try:
         config = get_config()
-        results = detect_late_night_events_wrapper(input_file, config=config)
-        return ('late_night', results)
+        results = detect_night_driving_events_wrapper(input_file, config=config)
+        return ('night_driving', results)
     except Exception as e:
-        return ('late_night', {'error': str(e)})
+        return ('night_driving', {'error': str(e)})
 
 def event_time_overlap(event1, event2):
     """
@@ -333,43 +498,6 @@ def event_time_overlap(event1, event2):
     event1/event2: dicts with 'start_time' and 'end_time' (unix timestamps)
     """
     return not (event1['end_time'] < event2['start_time'] or event2['end_time'] < event1['start_time'])
-
-def distracted_event_overlap_analysis(distracted_events, accel_events, speeding_events, cornering_events):
-    """
-    For each distracted event, check for overlap with accel/decel, speeding, and cornering events.
-    Print details and count overlaps.
-    """
-    overlap_counts = {'accel_decel': 0, 'speeding': 0, 'cornering': 0}
-    print("\n======= DISTRACTED EVENT OVERLAP ANALYSIS =======")
-    for d_event in distracted_events:
-        # Accel/Decel
-        for a_event in accel_events:
-            a_start = a_event['start']['timestamp_raw']
-            a_end = a_event['end']['timestamp_raw']
-            accel_event = {'start_time': a_start, 'end_time': a_end}
-            if event_time_overlap(d_event, accel_event):
-                overlap_counts['accel_decel'] += 1
-                print(f"Distracted event ({d_event['start_time']} - {d_event['end_time']}, len={d_event['length']}) OVERLAPS with Accel/Decel event ({a_start} - {a_end}, type={a_event['type']})")
-        # Speeding
-        for s_event in speeding_events:
-            s_time = int(s_event['PutRequest']['Item']['timestamp#user_id'].split('#')[0])
-            # Speeding events are point events, treat as instant
-            if d_event['start_time'] <= s_time <= d_event['end_time']:
-                overlap_counts['speeding'] += 1
-                print(f"Distracted event ({d_event['start_time']} - {d_event['end_time']}, len={d_event['length']}) OVERLAPS with Speeding event ({s_time})")
-        # Cornering
-        for c_event in cornering_events:
-            c_start = c_event['start_time_unix']
-            c_end = c_event['end_time_unix']
-            corner_event = {'start_time': c_start, 'end_time': c_end}
-            if event_time_overlap(d_event, corner_event):
-                overlap_counts['cornering'] += 1
-                print(f"Distracted event ({d_event['start_time']} - {d_event['end_time']}, len={d_event['length']}) OVERLAPS with Cornering event ({c_start} - {c_end}, type={c_event['event_type']})")
-    print("\n======= DISTRACTED EVENT OVERLAP COUNTS =======")
-    print(f"Accel/Decel Overlaps: {overlap_counts['accel_decel']}")
-    print(f"Speeding Overlaps: {overlap_counts['speeding']}")
-    print(f"Cornering Overlaps: {overlap_counts['cornering']}")
-    return overlap_counts
 
 def convert_decimals(obj):
     if isinstance(obj, list):
@@ -381,6 +509,374 @@ def convert_decimals(obj):
     else:
         return obj
 
+def extract_waypoints_from_results(results):
+    """
+    Extract waypoints from all event detection results.
+    
+    Args:
+        results (dict): Results from all event detection
+        
+    Returns:
+        list: List of waypoint dictionaries
+    """
+    waypoints = []
+    
+    # Use speeding results if available (most comprehensive data)
+    if 'speeding' in results and 'error' not in results['speeding']:
+        speeding_data = results['speeding']
+        geocode_to_segment = speeding_data.get('geocode_to_segment', {})
+        travelled_segments = speeding_data.get('travelled_segments', {})
+        
+        for (lat, lon, distracted, traveling_speed, timestamp), segment_data in geocode_to_segment.items():
+            segment_id = segment_data['segment_id']
+            segment = travelled_segments[segment_id]
+            
+            # Get speed limits from different sources
+            osm_speed_limit = segment['osm_speed_limit'] if segment['osm_speed_limit'] and segment['osm_speed_limit'] != 'Unknown' else 0
+            mapillary_speed_limit = segment['mapillary_speed_limit'] if segment['mapillary_speed_limit'] > 0 else 0
+            mapquest_speed_limit = (
+                segment['mapquest_speed_limit']
+                if isinstance(segment['mapquest_speed_limit'], (int, float)) and segment['mapquest_speed_limit'] > 0
+                else 0
+            )
+            
+            waypoint = {
+                "lat": lat,
+                "lon": lon,
+                "timestamp": timestamp,
+                "traveling_speed_mph": traveling_speed,
+                "speed_limit_source_1": osm_speed_limit,      # OSM speed limit
+                "speed_limit_source_2": mapillary_speed_limit, # Mapillary speed limit
+                "speed_limit_source_3": mapquest_speed_limit,   # MapQuest speed limit
+                "road_name": segment.get('road_name', 'Unknown'),
+                "road_type": segment.get('road_type', 'Unknown'),
+                "distance_meters": segment_data.get('distance_meters', 0)
+            }
+            waypoints.append(waypoint)
+    
+    return waypoints
+
+def format_events_for_summary(results, config):
+    """
+    Format detected events for the trip summary.
+    
+    Args:
+        results (dict): Results from all event detection
+        config (dict): Configuration dictionary
+        
+    Enum Set:
+        0: "general_cornering
+        1: "speeding",
+        2: "hard_braking", 
+        3: "rapid_acceleration",
+        4: "hard_cornering",
+        5: "distracted_driving",
+        6: "night_driving_driving"    
+    
+    Returns:
+        list: Formatted events list
+    """
+    enabled_events = {
+        'speeding': config.get('ENABLE_SPEEDING', True),
+        'road_familiarity': config.get('ENABLE_ROAD_FAMILIARITY', True),
+        'road_types': config.get('ENABLE_ROAD_TYPES', True),
+        'cornering': config.get('ENABLE_CORNERING', True),
+        'hard_braking': config.get('ENABLE_HARD_BRAKING', True),
+        'rapid_acceleration': config.get('ENABLE_RAPID_ACCELERATION', True),
+        'distracted': config.get('ENABLE_DISTRACTED', True),
+        'night_driving': config.get('ENABLE_NIGHT_DRIVING', True),
+    }
+
+    events = []
+    
+    # Speeding Events
+    if enabled_events['speeding']:
+        if 'speeding' in results and 'error' not in results['speeding']:
+            speeding_data = results['speeding']
+            if 'grouped_events' in speeding_data:
+                for i, event in enumerate(speeding_data['grouped_events']):
+                    if not event:
+                        continue
+                        
+                    start_event = event[0]
+                    end_event = event[-1]
+                    duration_sec = end_event['timestamp'] - start_event['timestamp']
+                    
+                    # Get road history stats
+                    road_history_stats = speeding_data.get('road_history_stats', {})
+                    
+                    event_data = {
+                        "event_type": 1,  # speeding
+                        "start_time": convert_timestamp(start_event['timestamp'], 'datetime'),
+                        "end_time": convert_timestamp(end_event['timestamp'], 'datetime'),
+                        "traveling_speed_mph": start_event['speed'],
+                        "speed_limit_mph": start_event['limit'],
+                        "duration_sec": duration_sec,
+                        "details": {
+                            "speed_excess_mph": start_event['speed'] - start_event['limit'],
+                            "road_type": start_event.get('road_type', 'Unknown'),
+                        }
+                    }
+
+                    if enabled_events['road_familiarity']:
+                        event_data["details"]["road_history_stats"] = {
+                            "total_segments": road_history_stats.get('total_segments', 0),
+                            "segments_driven_recently": road_history_stats.get('segments_driven_recently', 0),
+                            "segments_not_driven_recently": road_history_stats.get('segments_not_driven_recently', 0)
+                        }
+
+                    # Get road types travelled on 
+                    road_types_travelled = speeding_data.get('road_types_travelled', {})
+
+                    if enabled_events['road_types']:
+                        event_data["details"]["road_types_travelled"] = road_types_travelled
+
+                    events.append(event_data)
+    
+    # Cornering Events
+    if enabled_events['cornering']:
+        if 'cornering' in results and 'error' not in results['cornering']:
+            for event in results['cornering']:
+                event_type = 4 if event['event_type'] == 'Hard Cornering' else 0  # hard_cornering or general_cornering
+                
+                event_data = {
+                    "event_type": event_type,
+                    "start_location": event['start_location'],
+                    "end_location": event['end_location'],
+                    "start_time": event['start_time_readable'],
+                    "end_time": event['end_time_readable'],
+                    "duration_sec": event['duration'],
+                    "details": {
+                        "angular_velocity_deg_s": event['angular_velocity_deg_s'],
+                        "lateral_acceleration_g": event['lateral_acceleration_g'],
+                    }
+                }
+                events.append(event_data)
+    
+    # Acceleration/Deceleration Events
+    if enabled_events['hard_braking'] or enabled_events['rapid_acceleration']:
+        if 'accel_decel' in results and 'error' not in results['accel_decel']:
+            for event in results['accel_decel']:
+                event_name = event.get('type')
+
+                # Determine event type ID
+                if event_name == 'Hard Braking':
+                    if not enabled_events.get('hard_braking'):
+                        continue  # Skip if not enabled
+                    event_type = 2
+                elif event_name == 'Rapid Acceleration':
+                    if not enabled_events.get('rapid_acceleration'):
+                        continue  # Skip if not enabled
+                    event_type = 3
+                else:
+                    continue  # Unknown event type, skip
+
+                start = event['start']
+                end = event['end']
+                duration_sec = end['timestamp_raw'] - start['timestamp_raw'] + 1
+                
+                event_data = {
+                    "event_type": event_type,
+                    "start_lat": start['lat'],
+                    "start_lon": start['lon'],
+                    "end_lat": end['lat'],
+                    "end_lon": end['lon'],
+                    "start_time": start['timestamp_hr'],
+                    "end_time": end['timestamp_hr'],
+                    "duration_sec": duration_sec,
+                    "details": {
+                        "max_acceleration_mph_s": event['max_accel']
+                    }
+                }
+                events.append(event_data)
+    
+    # Distracted Driving Events
+    if enabled_events['distracted']:
+        if 'distracted' in results and 'error' not in results['distracted']:
+            for event in results['distracted']:
+                event_data = {
+                    "event_type": 5,  # distracted_driving
+                    # "start": event['start_idx'],
+                    # "end": event['end_idx'],
+                    "start_time": event['start_time'],
+                    "end_time": event['end_time'],
+                    "duration_sec": event['length']
+                }
+                events.append(event_data)
+    
+    # Night Driving Events
+    if enabled_events['night_driving']:
+        if 'night_driving' in results and 'error' not in results['night_driving']:
+            night_driving_results = results['night_driving']
+            if night_driving_results['total_night_driving_seconds'] > 0:
+                event_data = {
+                    "event_type": 6,  # night_driving_driving
+                    "total_night_driving_seconds": night_driving_results['total_night_driving_seconds'],
+                    "total_night_driving_minutes": night_driving_results['total_night_driving_minutes'],
+                    "total_night_driving_hours": night_driving_results['total_night_driving_hours'],
+                    "night_driving_percentage": night_driving_results['night_driving_percentage'],
+                    "timezone_used": night_driving_results['timezone_used']
+                }
+                events.append(event_data)
+    
+    return events
+
+def generate_trip_summary(results, user_data_points, config, enabled_events):
+    """
+    Generate a comprehensive trip summary JSON file.
+    
+    Args:
+        results (dict): Results from all event detection
+        config (dict): Configuration dictionary
+        
+    Returns:
+        dict: Trip summary dictionary
+    """
+    # Extract waypoints from all event detection results
+
+    if enabled_events.get('speeding'):
+        waypoints = extract_waypoints_from_results(results)
+    else:
+        waypoints = user_data_points
+
+    if not waypoints:
+        return {"error": "No valid waypoints found in event detection results"}
+    
+    # Assign start and end points
+    start_point = waypoints[0]
+    end_point = waypoints[-1]
+    
+    total_distance, total_seconds = calculate_distance_and_duration(user_data_points)
+    
+    # Get configuration values from environment
+    drive_id = config.get('DRIVE_ID', '')
+    device_id = config.get('DEVICE_ID', '')
+    account_id = config.get('ACCOUNT_ID', '19857054769')
+    utc_offset = config.get('UTC_OFFSET', '-04:00:00')
+    classification = config.get('CLASSIFICATION', 'car')
+    
+    # Validate required environment variables
+    if not drive_id:
+        return {"error": "DRIVE_ID not set in environment variables"}
+    if not device_id:
+        return {"error": "DEVICE_ID not set in environment variables"}
+    
+    # Format events
+    events = format_events_for_summary(results, config)
+    
+    # Create comprehensive summary
+    summary = {
+        "total_events": 0,
+    }
+    
+    # Populate summary from results
+    if enabled_events['speeding'] and 'speeding' in results and 'error' not in results['speeding']:
+        speeding_data = results['speeding']
+        summary['speeding_events'] = len(speeding_data.get('grouped_events', []))
+        
+        # Road history stats
+        if enabled_events['road_familiarity']:
+            road_history = speeding_data.get('road_history_stats', {})
+            if 'error' not in road_history:
+                summary['road_segments_total'] = road_history.get('total_segments', 0)
+                summary['road_segments_recent'] = road_history.get('segments_driven_recently', 0)
+                summary['road_segments_new'] = road_history.get('segments_not_driven_recently', 0)
+
+        # Road Types Travelled
+        # Road history stats
+        if enabled_events['road_types']:
+            road_types_travelled = speeding_data.get('road_types_travelled', {})
+            if 'error' not in road_history:
+                summary['road_types_travelled'] = road_types_travelled
+    
+    if enabled_events['cornering'] and 'cornering' in results and 'error' not in results['cornering']:
+        summary['cornering_events'] = len(results['cornering'])
+    
+    if (enabled_events['hard_braking'] or enabled_events['rapid_acceleration']) and 'accel_decel' in results and 'error' not in results['accel_decel']:
+        accel_decel_events = results['accel_decel']
+        hard_braking_count = 0
+        rapid_accel_count = 0
+
+        for e in accel_decel_events:
+            etype = e.get('type', '')
+            if etype == 'Hard Braking':
+                hard_braking_count += 1
+            elif etype == 'Rapid Acceleration':
+                rapid_accel_count += 1
+
+        if enabled_events['hard_braking']:
+            summary['hard_braking_events'] = hard_braking_count
+        if enabled_events['rapid_acceleration']:
+            summary['rapid_acceleration_events'] = rapid_accel_count
+    
+    if enabled_events['distracted'] and 'distracted' in results and 'error' not in results['distracted']:
+        summary['distracted_events'] = len(results['distracted'])
+    
+    if enabled_events['night_driving'] and 'night_driving' in results and 'error' not in results['night_driving']:
+        summary['night_driving_seconds'] = results['night_driving'].get('total_night_driving_seconds', 0)
+    
+    summary['total_events'] = (
+        summary.get('speeding_events', 0) +
+        summary.get('cornering_events', 0) +
+        summary.get('hard_braking_events', 0) +
+        summary.get('rapid_acceleration_events', 0) +
+        summary.get('distracted_events', 0)
+    )
+
+    
+    # Create the trip summary
+    trip_summary = {
+        "driveid": drive_id,
+        "distance_miles": total_distance,
+        "duration": total_seconds,
+        "driving": True,
+        "id": int(datetime.now().timestamp()),  # Use current timestamp as ID
+        "deviceid": device_id,
+        "utc_offset": utc_offset,
+        "classification": classification,
+        "start": {
+            "ts": convert_timestamp(start_point['timestamp'], 'datetime'),
+            "lat": start_point['lat'],
+            "lon": start_point['lon']
+        },
+        "end": {
+            "ts": convert_timestamp(end_point['timestamp'], 'datetime'),
+            "lat": end_point['lat'],
+            "lon": end_point['lon']
+        },
+        "night_driving_seconds": summary['night_driving_seconds'] if 'night_driving_seconds' in summary else 0,
+        "account_id": account_id,
+        "events": events,
+        "waypoints": waypoints,
+        "summary": summary
+    }
+    
+    return trip_summary
+
+def save_trip_summary(trip_summary, output_file=None):
+    """
+    Save trip summary to JSON file.
+    
+    Args:
+        trip_summary (dict): Trip summary dictionary
+        output_file (str): Output file path (optional)
+        
+    Returns:
+        str: Path to saved file
+    """
+    if output_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"trip_summary_{timestamp}.json"
+    
+    # Convert any Decimal objects to float for JSON serialization
+    trip_summary_clean = convert_decimals(trip_summary)
+    
+    with open(output_file, 'w') as f:
+        json.dump(trip_summary_clean, f, indent=2)
+    
+    return output_file
+    
+
 def main():
     """
     Main entry point for detecting all driving events.
@@ -388,32 +884,40 @@ def main():
     """
     parser = argparse.ArgumentParser(description='Detect all driving events from input file')
     parser.add_argument('input_file', help='Path to the input file containing driving data')
-    parser.add_argument('--events', nargs='+', choices=['speeding', 'cornering', 'accel_decel', 'distracted', 'late_night', 'all'], 
+    parser.add_argument('--events', nargs='+', choices=['speeding', 'cornering', 'accel_decel', 'distracted', 'night_driving', 'all'], 
                        default=['all'], help='Types of events to detect')
     parser.add_argument('--max-workers', type=int, default=3, 
                        help='Maximum number of parallel workers (default: 3)')
     parser.add_argument('--min-distracted', type=int, default=3, help='Minimum consecutive distracted points (default: 3)')
+    parser.add_argument('--output-summary', type=str, default=None, 
+                       help='Output file path for trip summary JSON (default: auto-generated)')
     args = parser.parse_args()
 
     try:
-        # Determine which events to process
-        events_to_process = []
-        if 'all' in args.events:
-            events_to_process = ['speeding', 'cornering', 'accel_decel', 'distracted', 'late_night']
-        else:
+        # Get configuration and determine which events to process
+        config = get_config()
+        events_to_process, enabled_events = determine_events_to_process(config)
+        
+        # Override with command line arguments if provided (for backward compatibility)
+        if 'all' not in args.events:
             events_to_process = args.events
 
         print(f"Processing events: {', '.join(events_to_process)}")
+        print(f"Event configuration:")
+        for event, enabled in enabled_events.items():
+            status = "✓" if enabled else "✗"
+            print(f"  {status} {event.replace('_', ' ').title()}")
         print(f"Using {min(args.max_workers, len(events_to_process))} parallel workers")
+
+        user_data_points = parse_points(args.input_file)
         
         # Create mapping of event types to their detection functions
-        config = get_config()
         detection_functions = {
             'speeding': run_speeding_detection,
             'cornering': run_cornering_detection,
             'accel_decel': run_accel_decel_detection,
             'distracted': run_distracted_detection,
-            'late_night': run_late_night_detection
+            'night_driving': run_night_driving_detection
         }
 
         # Run detection tasks in parallel
@@ -441,26 +945,29 @@ def main():
         total_processing_time = time.time() - start_time
         
         # Print results for each event type
-        if 'speeding' in results and 'error' not in results['speeding']:
-            print_speeding_records(results['speeding'])
+        if enabled_events['speeding'] and 'speeding' in results and 'error' not in results['speeding']:
+            # print_speeding_records(results['speeding']) ## Uncomment to print detailed speeding records for each geocode
             print_grouped_speeding_events(results['speeding']['grouped_events'])
-            print_road_history_stats(results['speeding']['road_history_stats'])
+            if enabled_events['road_familiarity']:
+                print_road_history_stats(results['speeding']['road_history_stats'])
+            if enabled_events['road_types']:
+                print_road_types_travelled(results['speeding']['road_types_travelled'])
             
-        if 'cornering' in results and 'error' not in results['cornering']:
+        if enabled_events['cornering'] and 'cornering' in results and 'error' not in results['cornering']:
             print("\n" + "="*50)
             print("CORNERING EVENTS")
             print("="*50)
             print_cornering_events(results['cornering'])
             print(f"Total Cornering Events Detected: {len(results['cornering'])}")
             
-        if 'accel_decel' in results and 'error' not in results['accel_decel']:
+        if (enabled_events['hard_braking'] or enabled_events['rapid_acceleration']) and 'accel_decel' in results and 'error' not in results['accel_decel']:
             print("\n" + "="*50)
             print("ACCELERATION/DECELERATION EVENTS")
             print("="*50)
             print_accel_decel_events(results['accel_decel'])
             print(f"Total Acceleration/Deceleration Events Detected: {len(results['accel_decel'])}")
         
-        if 'distracted' in results and 'error' not in results['distracted']:
+        if enabled_events['distracted'] and 'distracted' in results and 'error' not in results['distracted']:
             print_distracted_events(results['distracted'])
             distracted_events = results['distracted']
         elif 'distracted' in results:
@@ -470,10 +977,10 @@ def main():
             # Fallback for legacy runs
             distracted_events = []
             
-        if 'late_night' in results and 'error' not in results['late_night']:
-            print_late_night_events(results['late_night'])
-        elif 'late_night' in results:
-            print(f"Late Night Events: Error - {results['late_night']['error']}")
+        if enabled_events['night_driving'] and 'night_driving' in results and 'error' not in results['night_driving']:
+            print_night_driving_events(results['night_driving'])
+        elif 'night_driving' in results:
+            print(f"Night Driving Events: Error - {results['night_driving']['error']}")
 
         # Overlap analysis
         # accel_events = results.get('accel_decel', [])
@@ -487,54 +994,83 @@ def main():
         print("="*50)
         
         total_events = 0
-        if 'speeding' in results and 'error' not in results['speeding']:
+        if enabled_events['speeding'] and 'speeding' in results and 'error' not in results['speeding']:
             speeding_event_count = len(results['speeding']['grouped_events'])
             total_events += speeding_event_count
             print(f"Speeding Events: {speeding_event_count}")
             print(f"Speeding Records for this Trip: {results['speeding']['metrics']['speeding_records']}")
-            print(f"Total Distance: {results['speeding']['distance']:.2f} miles")
-            print(f"Total Duration: {results['speeding']['duration'][0]} minutes and {results['speeding']['duration'][1]} seconds")
             
             # Print road history summary
             road_history = results['speeding']['road_history_stats']
             if 'error' not in road_history:
-                print(f"Road Segments - Total: {road_history['total_segments']}, Recently Driven: {road_history['segments_driven_recently']}, New/Expired: {road_history['segments_not_driven_recently']}")
+                print(f"Road Segments - Total: {road_history['total_segments']}, Recently Driven: {road_history['segments_driven_recently']}, New: {road_history['segments_not_driven_recently']}")
         elif 'speeding' in results:
             print(f"Speeding Records: Error - {results['speeding']['error']}")
             
-        if 'cornering' in results and 'error' not in results['cornering']:
+        if enabled_events['cornering'] and 'cornering' in results and 'error' not in results['cornering']:
             cornering_count = len(results['cornering'])
             total_events += cornering_count
             print(f"Cornering Events: {cornering_count}")
         elif 'cornering' in results:
             print(f"Cornering Events: Error - {results['cornering']['error']}")
             
-        if 'accel_decel' in results and 'error' not in results['accel_decel']:
+        if (enabled_events['hard_braking'] or enabled_events['rapid_acceleration']) and 'accel_decel' in results and 'error' not in results['accel_decel']:
             accel_decel_count = len(results['accel_decel'])
             total_events += accel_decel_count
             print(f"Acceleration/Deceleration Events: {accel_decel_count}")
         elif 'accel_decel' in results:
             print(f"Acceleration/Deceleration Events: Error - {results['accel_decel']['error']}")
         
-        print(f"Distracted Driving Events: {len(distracted_events)}")
-        # Add Distracted Events
-        total_events += (len(distracted_events))
+        if enabled_events['distracted'] and 'distracted' in results and 'error' not in results['distracted']:
+            distracted_count = len(results['distracted'])
+            total_events += distracted_count
+            print(f"Distracted Events: {distracted_count}")
+        elif 'distracted' in results:
+            print(f"Distracted Events: Error - {results['distracted']['error']}")
         
-        if 'late_night' in results and 'error' not in results['late_night']:
-            late_night_seconds = results['late_night']['total_late_night_seconds']
-            print(f"Late Night Driving Time: {late_night_seconds} seconds ({results['late_night']['total_late_night_hours']} hours)")
-        elif 'late_night' in results:
-            print(f"Late Night Events: Error - {results['late_night']['error']}")
+        if 'night_driving' in results and 'error' not in results['night_driving']:
+            night_driving_seconds = results['night_driving']['total_night_driving_seconds']
+            print(f"Night Driving Time: {night_driving_seconds} seconds ({results['night_driving']['total_night_driving_hours']} hours)")
+        elif 'night_driving' in results:
+            print(f"Night Driving Events: Error - {results['night_driving']['error']}")
 
         print(f"\nTotal Events Detected: {total_events}")
         print(f"Total Parallel Processing Time: {total_processing_time:.2f} seconds")
         
-        # # Show performance improvement if speeding events were processed
-        # if 'speeding' in results and 'error' not in results['speeding']:
-        #     speeding_alone_time = results['speeding']['metrics']['timings']['total']
-        #     if len(events_to_process) > 1:
-        #         improvement = ((speeding_alone_time - total_processing_time) / speeding_alone_time) * 100
-        #         print(f"Performance improvement: {improvement:.1f}% faster than sequential processing")
+        # Generate trip summary
+        print("\n" + "="*50)
+        print("GENERATING TRIP SUMMARY")
+        print("="*50)
+        
+        try:
+            trip_summary = generate_trip_summary(results, user_data_points, config, enabled_events)
+            if 'error' in trip_summary:
+                print(f"Error generating trip summary: {trip_summary['error']}")
+            else:
+                # Save trip summary to file
+                output_file = save_trip_summary(trip_summary)
+                print(f"Trip summary saved to: {output_file}")
+                print(f"Trip Summary Stats:")
+                print(f"  - Drive ID: {trip_summary['driveid']}")
+                print(f"  - Total Distance: {trip_summary['distance_miles']:.2f} miles")
+                print(f"  - Total Events: {trip_summary['summary']['total_events']}")
+                if enabled_events['speeding']:
+                    print(f"  - Speeding Events: {trip_summary['summary']['speeding_events']}")
+                if enabled_events['cornering']:
+                    print(f"  - Cornering Events: {trip_summary['summary']['cornering_events']}")
+                if enabled_events['hard_braking']:
+                    print(f"  - Hard Braking Events: {trip_summary['summary']['hard_braking_events']}")
+                if enabled_events['rapid_acceleration']:
+                    print(f"  - Rapid Acceleration Events: {trip_summary['summary']['rapid_acceleration_events']}")
+                if enabled_events['distracted']:
+                    print(f"  - Distracted Events: {trip_summary['summary']['distracted_events']}")
+                if enabled_events['night_driving']:
+                    print(f"  - Night Driving: {trip_summary['summary']['night_driving_seconds']} seconds")
+        except Exception as e:
+            print(f"Error generating trip summary: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        
         
     except FileNotFoundError:
         print(f"Error: Input file '{args.input_file}' not found")

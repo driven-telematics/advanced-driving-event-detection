@@ -32,7 +32,7 @@ def parse_points(input_file):
             })
     return points
 
-def detect_late_night_events(input_file, config=None):
+def detect_night_driving_events(input_file, config=None):
     """
     Detect late night driving events between 12 AM and 4 AM local time.
     Automatically detects the system's local timezone.
@@ -55,9 +55,9 @@ def detect_late_night_events(input_file, config=None):
         if not points:
             return {
                 'error': 'No valid points found in input file',
-                'total_late_night_seconds': 0,
+                'total_night_driving_seconds': 0,
                 'total_points': 0,
-                'late_night_points': 0
+                'night_driving_points': 0
             }
         
         # Automatically detect the local timezone
@@ -76,8 +76,8 @@ def detect_late_night_events(input_file, config=None):
             timezone = pytz.UTC
             timezone_str = 'UTC'
         
-        late_night_seconds = 0
-        late_night_points = 0
+        night_driving_seconds = 0
+        night_driving_points = 0
         total_points = len(points)
         
         # Process each point to check if it's within late night hours
@@ -90,7 +90,7 @@ def detect_late_night_events(input_file, config=None):
             
             hour = dt_local.hour
             if lower_bound_drive_hour <= hour < upper_bound_drive_hour: 
-                late_night_points += 1
+                night_driving_points += 1
                 
                 # Calculate seconds for this point
                 # For the first point, assume 1 second duration
@@ -103,30 +103,30 @@ def detect_late_night_events(input_file, config=None):
                     # Ensure we don't have negative or unreasonably large durations
                     point_seconds = max(0, min(point_seconds, 300))  # Max 5 minutes between points
                 
-                late_night_seconds += point_seconds
+                night_driving_seconds += point_seconds
         
         return {
-            'total_late_night_seconds': late_night_seconds,
-            'total_late_night_minutes': round(late_night_seconds / 60, 2),
-            'total_late_night_hours': round(late_night_seconds / 3600, 2),
+            'total_night_driving_seconds': night_driving_seconds,
+            'total_night_driving_minutes': round(night_driving_seconds / 60, 2),
+            'total_night_driving_hours': round(night_driving_seconds / 3600, 2),
             'total_points': total_points,
-            'late_night_points': late_night_points,
-            'late_night_percentage': round((late_night_points / total_points) * 100, 2) if total_points > 0 else 0,
+            'night_driving_points': night_driving_points,
+            'night_driving_percentage': round((night_driving_points / total_points) * 100, 2) if total_points > 0 else 0,
             'timezone': timezone_str,
             'timezone_used': str(timezone)
         }
         
     except Exception as e:
         return {
-            'error': f'Error processing late night events: {str(e)}',
-            'total_late_night_seconds': 0,
+            'error': f'Error processing night driving events: {str(e)}',
+            'total_night_driving_seconds': 0,
             'total_points': 0,
-            'late_night_points': 0
+            'night_driving_points': 0
         }
 
-def detect_late_night_events_wrapper(input_file, config=None):
+def detect_night_driving_events_wrapper(input_file, config=None):
     """
-    Wrapper function for late night events detection to match the interface
+    Wrapper function for night events detection to match the interface
     expected by detect_all_driving_events.py
     
     Args:
@@ -136,7 +136,7 @@ def detect_late_night_events_wrapper(input_file, config=None):
     Returns:
         dict: Dictionary containing late night driving statistics
     """
-    return detect_late_night_events(input_file, config)
+    return detect_night_driving_events(input_file, config)
 
 def main():
     """
@@ -154,7 +154,7 @@ def main():
     }
     
     try:
-        results = detect_late_night_events(args.input_file, config)
+        results = detect_night_driving_events(args.input_file, config)
         
         if 'error' in results:
             print(f"Error: {results['error']}")
@@ -164,12 +164,11 @@ def main():
         print("LATE NIGHT DRIVING EVENTS (12 AM - 4 AM)")
         print("="*50)
         print(f"Timezone: {results['timezone_used']}")
-        print(f"Total Late Night Driving Time: {results['total_late_night_seconds']} seconds")
-        print(f"Total Late Night Driving Time: {results['total_late_night_minutes']} minutes")
-        print(f"Total Late Night Driving Time: {results['total_late_night_hours']} hours")
-        print(f"Total Points in Dataset: {results['total_points']}")
-        print(f"Points During Late Night Hours: {results['late_night_points']}")
-        print(f"Percentage of Points During Late Night: {results['late_night_percentage']}%")
+        print(f"Total Night Driving Time: {results['total_night_driving_seconds']} seconds")
+        print(f"Total Night Driving Time: {results['total_night_driving_minutes']} minutes")
+        print(f"Total Night Driving Time: {results['total_night_driving_hours']} hours")
+        print(f"Points During Night Hours: {results['night_driving_points']}")
+        print(f"Percentage of Points During Night: {results['night_driving_percentage']}%")
         
     except FileNotFoundError:
         print(f"Error: Input file '{args.input_file}' not found")

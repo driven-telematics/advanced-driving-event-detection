@@ -52,7 +52,7 @@ def detect_events(data_points, config):
             1) Acceleration is high (magnitude exceeds braking threshold).
             2) Velocity is decreasing (so the user is slowing down).
 
-        A hard acceleration event is when:
+        A rapid acceleration event is when:
             1) Acceleration is high (magnitude exceeds acceleration threshold).
             2) Velocity is increasing.
 
@@ -61,7 +61,7 @@ def detect_events(data_points, config):
         if curr_accel > braking_threshold and vel_change < 0 and curr['velocity'] > 15 and diff_accel > braking_threshold:
             event_type = "Hard Braking"
         elif curr_accel > accel_threshold and vel_change > 0 and curr['velocity'] > 15 and diff_accel > accel_threshold:
-            event_type = "Hard Acceleration"
+            event_type = "Rapid Acceleration"
         else:
             event_type = None
 
