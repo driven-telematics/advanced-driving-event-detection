@@ -9,13 +9,13 @@ The trip summary generation creates a comprehensive JSON file containing all det
 ## Features
 
 ### Event Types (Enum System)
-- **1**: Speeding events
-- **2**: Hard braking events  
-- **3**: Rapid acceleration events
-- **4**: Hard cornering events
-- **5**: General cornering events
-- **6**: Distracted driving events
-- **7**: Late night driving events
+0: "general_cornering
+1: "speeding",
+2: "hard_braking", 
+3: "rapid_acceleration",
+4: "hard_cornering",
+5: "distracted_driving",
+6: "night_driving_driving"    
 
 ### Trip Summary Structure
 

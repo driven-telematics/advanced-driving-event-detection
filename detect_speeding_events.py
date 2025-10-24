@@ -565,7 +565,7 @@ def convert_points_for_speeding_events(geocode_to_segment, travelled_segments):
             'speed': traveling_speed,
             'limit': valid_posted_speed_limit,
             'road_type': segment['road_type'],
-            'timestamp': int(timestamp)
+            'timestamp': timestamp
         })
     return result
 
@@ -603,7 +603,7 @@ def process_data_file(input_file, config):
 
     with open(input_file, "r") as file:
         data = file.read().strip().split("|")
-        points = [(float(p[0]), float(p[1]), int(p[2]), float(p[3]), p[4]) for p in (row.split(",") for row in data)]
+        points = [(float(p[0]), float(p[1]), int(p[2]), float(p[3]), int(p[4])) for p in (row.split(",") for row in data)]
         latitudes = [float(p[0]) for p in points]
         longitudes = [float(p[1]) for p in points]
         session_lat_min, session_lat_max = min(latitudes), max(latitudes)
@@ -656,7 +656,7 @@ def process_data_file(input_file, config):
     filtered_geocode_to_segment, removed_segments, unique_segments_count = count_segment_occurrences(geocode_to_segment)
     
     # Determine True Speeding Events
-    speeding_event_points = convert_points_for_speeding_events(geocode_to_segment,travelled_segments)
+    speeding_event_points = convert_points_for_speeding_events(geocode_to_segment, travelled_segments)
     grouped_events = driven_defined_speeding_events(speeding_event_points, config)
 
     # Check and update road segment history for 21-day tracking
@@ -765,8 +765,6 @@ def process_data_file(input_file, config):
             if isinstance(segment['mapquest_speed_limit'], (int, float)) and segment['mapquest_speed_limit'] > 0
             else 0
         )
-
-        # traveling_speed = next((p[3] for p in points if p[0] == lat and p[1] == lon and p[4] == timestamp), 0)
 
         speed_limit_sources = [osm_speed_limit, mapillary_speed_limit, mapquest_speed_limit]
         valid_posted_speed_limit = next((speed_limit for speed_limit in speed_limit_sources if speed_limit != 0), Decimal(0))  

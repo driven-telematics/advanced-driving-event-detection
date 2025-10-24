@@ -82,9 +82,6 @@ def detect_cornering_events(data, config):
                 end_time_unix = next_point["timestamp"]
                 duration = end_time_unix - start_time_unix
 
-                start_time_readable = datetime.fromtimestamp(start_time_unix, tz=timezone.utc).isoformat()
-                end_time_readable = datetime.fromtimestamp(end_time_unix, tz=timezone.utc).isoformat()
-
                 if duration <= turning_time_limit and prev_point["timestamp"] > last_event_end_time + cooldown_period:
                     events.append({
                         "event_type": event_type,
@@ -92,8 +89,6 @@ def detect_cornering_events(data, config):
                         "end_location": (next_point["lat"], next_point["lon"]),
                         "start_time_unix": start_time_unix,
                         "end_time_unix": end_time_unix,
-                        "start_time_readable": start_time_readable,
-                        "end_time_readable": end_time_readable,
                         "duration": duration,
                         "angular_velocity_deg_s": round(angular_velocity_magnitude_deg, 2),
                         "lateral_acceleration_g": round(lateral_acceleration_magnitude, 3)
@@ -131,10 +126,6 @@ if __name__ == "__main__":
         print(f"Event: {event['event_type']}")
         print(f"  Start Location: {event['start_location']}")
         print(f"  End Location: {event['end_location']}")
-        print(f"  Start ID: {event['start_time_unix']}")
-        print(f"  End ID: {event['end_time_unix']}")
-        print(f"  Start Time: {event['start_time_readable']}")
-        print(f"  End Time: {event['end_time_readable']}")
         print(f"  Timestamp Start: {event['start_time_unix']}")
         print(f"  Timestamp End: {event['end_time_unix']}")
         print(f"  Duration: {event['duration']} seconds")

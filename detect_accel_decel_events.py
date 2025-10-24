@@ -11,7 +11,7 @@ def parse_data_point(raw):
     lat = float(fields[0])
     lon = float(fields[1])
     velocity = float(fields[3])
-    timestamp_raw = int(fields[4])
+    timestamp = int(fields[4])
     accel_x = float(fields[8])
     accel_y = float(fields[9])
     accel_z = float(fields[10])
@@ -23,12 +23,11 @@ def parse_data_point(raw):
         "lat": lat,
         "lon": lon,
         "velocity": velocity,
-        "timestamp_raw": timestamp_raw,
-        "timestamp_hr": datetime.fromtimestamp(timestamp_raw).strftime('%H:%M:%S'),
+        "timestamp": timestamp,
         "accel_mphs": accel_magnitude_mphs
     }
 
-def detect_events(data_points, config):
+def detect_braking_acceleration_events(data_points, config):
     events = [] # final list of detected events
     current_event = None # tracking of current ongoing event
     
@@ -92,20 +91,6 @@ def detect_events(data_points, config):
 
     return events
 
-def print_events(events):
-    for e in events:
-        start = e['start']
-        end = e['end']
-        duration = end['timestamp_raw'] - start['timestamp_raw'] + 1
-        print(f"Event: {e['type']}")
-        print(f"  Location: ({start['lat']}, {start['lon']})")
-        print(f"  ID: {start['timestamp_raw']}")
-        print(f"  Start Time: {start['timestamp_hr']}")
-        print(f"  End Time: {end['timestamp_hr']}")
-        print(f"  Duration: {duration} seconds")
-        print(f"  Max Acceleration Magnitude: {e['max_accel']:.2f} mph/s")
-        print("")
-
 def detect_accel_decel_events_wrapper(input_file, config=None):
     """
     Main function to detect acceleration/deceleration events from a given input file.
@@ -127,7 +112,20 @@ def detect_accel_decel_events_wrapper(input_file, config=None):
     data_points = [parse_data_point(s) for s in data_strings]
     data_points = [point for point in data_points if point is not None]
     
-    return detect_events(data_points, config)
+    return detect_braking_acceleration_events(data_points, config)
+
+def print_events(events):
+    for e in events:
+        start = e['start']
+        end = e['end']
+        duration = end['timestamp'] - start['timestamp'] + 1
+        print(f"Event: {e['type']}")
+        print(f"  Location: ({start['lat']}, {start['lon']})")
+        print(f"  Start Time: {start['timestamp']}")
+        print(f"  End Time: {end['timestamp']}")
+        print(f"  Duration: {duration} seconds")
+        print(f"  Max Acceleration Magnitude: {e['max_accel']:.2f} mph/s")
+        print("")
 
 if __name__ == "__main__":
     # Run the script with an example file

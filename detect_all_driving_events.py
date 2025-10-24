@@ -64,13 +64,12 @@ def get_config():
         # Event Detection Toggles
         'ENABLE_SPEEDING': os.environ.get('ENABLE_SPEEDING', 'true').lower() == 'true',
         'ENABLE_ROAD_FAMILIARITY': os.environ.get('ENABLE_ROAD_FAMILIARITY', 'true').lower() == 'true',
+        'ENABLE_ROAD_TYPES': os.environ.get('ENABLE_ROAD_TYPES', 'true').lower() == 'true',
         'ENABLE_CORNERING': os.environ.get('ENABLE_CORNERING', 'true').lower() == 'true',
         'ENABLE_HARD_BRAKING': os.environ.get('ENABLE_HARD_BRAKING', 'true').lower() == 'true',
         'ENABLE_RAPID_ACCELERATION': os.environ.get('ENABLE_RAPID_ACCELERATION', 'true').lower() == 'true',
         'ENABLE_DISTRACTED': os.environ.get('ENABLE_DISTRACTED', 'true').lower() == 'true',
         'ENABLE_NIGHT_DRIVING': os.environ.get('ENABLE_NIGHT_DRIVING', 'true').lower() == 'true',
-        'ENABLE_ROAD_TYPES': os.environ.get('ENABLE_ROAD_TYPES', 'true').lower() == 'true',
-
         
         # Trip Summary Configuration
         'ACCOUNT_ID': os.environ.get('ACCOUNT_ID', '19857054769'),
@@ -79,6 +78,10 @@ def get_config():
         'DRIVE_ID': os.environ.get('DRIVE_ID', '20251021/12300_12300_00001'),
         'DEVICE_ID': os.environ.get('DEVICE_ID', 'CEE06157DECA4099'),
     }
+
+    if not config['ENABLE_SPEEDING']:
+        config['ENABLE_ROAD_FAMILIARITY'] = False
+        config['ENABLE_ROAD_TYPES'] = False
     
     return config
 
@@ -116,6 +119,9 @@ def convert_timestamp(timestamp, format):
         return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
     elif format == 'datetime':
         return datetime.fromtimestamp(timestamp).isoformat() + "Z"
+    elif format == 'epoch':
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        return int(dt.timestamp())
 
 def calculate_distance_and_duration(points):
     """
@@ -278,8 +284,8 @@ def print_cornering_events(events):
         print(f"Event: {event['event_type']}")
         print(f"  Start Location: {event['start_location']}")
         print(f"  End Location: {event['end_location']}")
-        print(f"  Start Time: {event['start_time_readable']}")
-        print(f"  End Time: {event['end_time_readable']}")
+        print(f"  Start Time: {convert_timestamp(event['start_time_unix'], 'datetime')}")
+        print(f"  End Time: {convert_timestamp(event['end_time_unix'], 'datetime')}")
         print(f"  Timestamp Start: {event['start_time_unix']}")
         print(f"  Timestamp End: {event['end_time_unix']}")
         print(f"  Duration: {event['duration']} seconds")
@@ -296,11 +302,11 @@ def print_accel_decel_events(events):
     for event in events:
         start = event['start']
         end = event['end']
-        duration = end['timestamp_raw'] - start['timestamp_raw'] + 1
+        duration = end['timestamp'] - start['timestamp'] + 1
         print(f"Event: {event['type']}")
         print(f"  Location: ({start['lat']}, {start['lon']})")
-        print(f"  Start Time: {start['timestamp_hr']}")
-        print(f"  End Time: {end['timestamp_hr']}")
+        print(f"  Start Time: {convert_timestamp(start['timestamp'], 'datetime')}")
+        print(f"  End Time: {convert_timestamp(end['timestamp'], 'datetime')}")
         print(f"  Duration: {duration} seconds")
         print(f"  Max Acceleration Magnitude: {event['max_accel']:.2f} mph/s\n")
 
@@ -492,13 +498,6 @@ def run_night_driving_detection(input_file):
     except Exception as e:
         return ('night_driving', {'error': str(e)})
 
-def event_time_overlap(event1, event2):
-    """
-    Returns True if event1 and event2 time windows overlap.
-    event1/event2: dicts with 'start_time' and 'end_time' (unix timestamps)
-    """
-    return not (event1['end_time'] < event2['start_time'] or event2['end_time'] < event1['start_time'])
-
 def convert_decimals(obj):
     if isinstance(obj, list):
         return [convert_decimals(i) for i in obj]
@@ -600,7 +599,7 @@ def format_events_for_summary(results, config):
                         
                     start_event = event[0]
                     end_event = event[-1]
-                    duration_sec = end_event['timestamp'] - start_event['timestamp']
+                    duration_sec = end_event['timestamp'] - start_event['timestamp'] + 1
                     
                     # Get road history stats
                     road_history_stats = speeding_data.get('road_history_stats', {})
@@ -643,8 +642,8 @@ def format_events_for_summary(results, config):
                     "event_type": event_type,
                     "start_location": event['start_location'],
                     "end_location": event['end_location'],
-                    "start_time": event['start_time_readable'],
-                    "end_time": event['end_time_readable'],
+                    "start_time": convert_timestamp(event['start_time_unix'], 'datetime'),
+                    "end_time": convert_timestamp(event['end_time_unix'], 'datetime'),
                     "duration_sec": event['duration'],
                     "details": {
                         "angular_velocity_deg_s": event['angular_velocity_deg_s'],
@@ -673,7 +672,7 @@ def format_events_for_summary(results, config):
 
                 start = event['start']
                 end = event['end']
-                duration_sec = end['timestamp_raw'] - start['timestamp_raw'] + 1
+                duration_sec = end['timestamp'] - start['timestamp'] + 1
                 
                 event_data = {
                     "event_type": event_type,
@@ -681,8 +680,8 @@ def format_events_for_summary(results, config):
                     "start_lon": start['lon'],
                     "end_lat": end['lat'],
                     "end_lon": end['lon'],
-                    "start_time": start['timestamp_hr'],
-                    "end_time": end['timestamp_hr'],
+                    "start_time": convert_timestamp(start['timestamp'], 'datetime'),
+                    "end_time": convert_timestamp(end['timestamp'], 'datetime'),
                     "duration_sec": duration_sec,
                     "details": {
                         "max_acceleration_mph_s": event['max_accel']
@@ -698,8 +697,8 @@ def format_events_for_summary(results, config):
                     "event_type": 5,  # distracted_driving
                     # "start": event['start_idx'],
                     # "end": event['end_idx'],
-                    "start_time": event['start_time'],
-                    "end_time": event['end_time'],
+                    "start_time": convert_timestamp(event['start_time'], 'datetime'),
+                    "end_time": convert_timestamp(event['end_time'], 'datetime'),
                     "duration_sec": event['length']
                 }
                 events.append(event_data)
@@ -828,7 +827,7 @@ def generate_trip_summary(results, user_data_points, config, enabled_events):
     trip_summary = {
         "driveid": drive_id,
         "distance_miles": total_distance,
-        "duration": total_seconds,
+        "duration_seconds": total_seconds,
         "driving": True,
         "id": int(datetime.now().timestamp()),  # Use current timestamp as ID
         "deviceid": device_id,
@@ -980,13 +979,7 @@ def main():
         if enabled_events['night_driving'] and 'night_driving' in results and 'error' not in results['night_driving']:
             print_night_driving_events(results['night_driving'])
         elif 'night_driving' in results:
-            print(f"Night Driving Events: Error - {results['night_driving']['error']}")
-
-        # Overlap analysis
-        # accel_events = results.get('accel_decel', [])
-        # speeding_records = results.get('speeding', {}).get('grouped_events', [])
-        # cornering_events = results.get('cornering', [])
-       
+            print(f"Night Driving Events: Error - {results['night_driving']['error']}")    
         
         # Print comprehensive summary
         print("\n" + "="*50)
@@ -1070,6 +1063,10 @@ def main():
             print(f"Error generating trip summary: {str(e)}")
             import traceback
             traceback.print_exc()
+
+
+        # Send Results Dict to Scoring Algorithm for Overlap Detection + Scoring Flow
+
         
         
     except FileNotFoundError:
