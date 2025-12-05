@@ -1,16 +1,17 @@
 from datetime import datetime, timezone
 import requests
-import re
 import time
 from geopy.distance import geodesic
 from shapely.geometry import Point, LineString
 from shapely.ops import nearest_points
 import boto3
-from decimal import Decimal
 from collections import defaultdict
+from helper_functions import extract_float, normalize_decimal
+from decimal import Decimal, ROUND_UP, ROUND_DOWN
 
 # Initialize the DynamoDB client
-dynamodb = boto3.resource('dynamodb')
+session = boto3.Session(profile_name='local-dynamo-db-access')
+dynamodb = session.resource('dynamodb')
 
 # Function to batch fetch road segment data from DynamoDB
 def batch_get_items(keys, config):
@@ -270,17 +271,6 @@ def determine_road_types_travelled(travelled_segments, config):
 
     return road_types_travelled
 
-def write_speed_data_to_file(file_path, lat, lon, distracted, traveling_speed,
-                            osm_speed_limit, mapillary_speed_limit, mapquest_speed_limit, highway_type, timestamp):
-
-    speed_limit_sources = [osm_speed_limit, mapillary_speed_limit, mapquest_speed_limit]
-    valid_speed_limit = next((speed_limit for speed_limit in speed_limit_sources if speed_limit != 0), 0)  
-
-    with open(file_path, "a") as file:
-        file.write(
-            f"{lat},{lon},{distracted},{traveling_speed},{valid_speed_limit},{highway_type},{timestamp}|\n"
-        )
-
 def count_segment_occurrences(geocode_to_segment):
     segment_count = defaultdict(int)
 
@@ -288,9 +278,6 @@ def count_segment_occurrences(geocode_to_segment):
     for value in geocode_to_segment.values():
         segment_id = value["segment_id"]
         segment_count[segment_id] += 1
-    
-    # print(segment_count)
-    # print(f"Length of original segment count: {len(segment_count)}")
 
     # Filter out segments with count < n number of occurences
     filtered_segment_count = {seg_id: count for seg_id, count in segment_count.items() if count >= 5}
@@ -300,16 +287,6 @@ def count_segment_occurrences(geocode_to_segment):
 
 def convert_to_lat_lon(coords):
     return [(entry['lat'], entry['lon']) for entry in coords]
-
-def extract_float(value: str) -> float:
-    """
-    Extracts the numeric value from a string and converts it to a float.
-    
-    :param value: A string containing a number with possible text.
-    :return: The extracted number as a float.
-    """
-    match = re.search(r"\d+\.?\d*", value)
-    return float(match.group()) if match else None
 
 def get_bounding_box(points):
     latitudes = [p[0] for p in points]
@@ -337,14 +314,6 @@ def get_road_segments(lat_min, lon_min, lat_max, lon_max, config):
     else:
         print(f"Error fetching data: {response.status_code}, {response.text}")
         return []
-
-def get_unknown_speed_road_segments(road_segments):
-    unknown_speed_road_segments = []
-    for road in road_segments:
-        speed_limit = road["tags"].get("maxspeed", "Unknown")
-        if speed_limit == "Unknown":
-            unknown_speed_road_segments.append(road)
-    return unknown_speed_road_segments
 
 # Function to parse speed limits from Mapillary
 def parse_mapillary_speed_limit(object_value):
@@ -397,14 +366,14 @@ def calculate_distance_to_road_segment(sign_coords, road_coords):
 
     return min_distance
 
-def map_speed_sign_to_nearest_road(nearest_road, speed_signs):
+def map_speed_sign_to_nearest_road(nearest_road, maplillary_speed_signs):
     minlat, maxlat = nearest_road['bounds']['minlat'], nearest_road['bounds']['maxlat']
     minlon, maxlon = nearest_road['bounds']['minlon'], nearest_road['bounds']['maxlon']
     road_coords = [(point["lat"], point["lon"]) for point in nearest_road["geometry"]]
     # Ensure road segment has a "speed_signs" field
     nearest_road.setdefault("mapillary_speed_signs", [])
 
-    for sign in speed_signs:
+    for sign in maplillary_speed_signs:
         sign_coords = (sign["geometry"]["coordinates"][1], sign["geometry"]["coordinates"][0])  # (lat, lon)
         distance = calculate_distance_to_road_segment(sign_coords, road_coords)
 
@@ -421,42 +390,6 @@ def map_speed_sign_to_nearest_road(nearest_road, speed_signs):
             )
 
     return nearest_road
-
-def map_speed_signs_to_unknown_segments(unknown_road_segments, speed_signs):
-    """
-    Assigns speed limit signs to the closest road segment if within a 10-meter threshold.
-
-    :param unknown_road_segments: List of road segments with geometry data.
-    :param speed_signs: List of speed signs with latitude and longitude coordinates.
-    :return: Updated unknown_road_segments with assigned speed signs.
-    """
-    for road in unknown_road_segments:
-        minlat, maxlat = road['bounds']['minlat'], road['bounds']['maxlat']
-        minlon, maxlon = road['bounds']['minlon'], road['bounds']['maxlon']
-        road_coords = [(point["lat"], point["lon"]) for point in road["geometry"]]
-        
-        # Ensure road segment has a "speed_signs" field
-        road.setdefault("mapillary_speed_signs", [])
-
-        for sign in speed_signs:
-            sign_coords = (sign["geometry"]["coordinates"][1], sign["geometry"]["coordinates"][0])  # (lat, lon)
-            distance = calculate_distance_to_road_segment(sign_coords, road_coords)
-
-            if distance < 10 and minlat <= sign_coords[0] <= maxlat and minlon <= sign_coords[1] <= maxlon:  # Assign sign if within 10 meters
-            # if distance < 20:  # Assign sign if within 10 meters
-                road["mapillary_speed_signs"].append(
-                    {
-                        "sign_id": sign["id"],
-                        "object_value": sign["object_value"],
-                        "speed_limit": parse_mapillary_speed_limit(sign["object_value"]), 
-                        "sign_coords": sign_coords,
-                        "distance": distance,
-                        "speed_service_used": "Mapillary"
-                    }
-                )
-
-    return unknown_road_segments
-
 
 # Helper function to find distance between user and road segment
 def calculate_distance_user_to_road_segment(user_coords, road_coords):
@@ -502,11 +435,10 @@ def find_nearest_road(user_coords, road_segments):
                 "road_name": road["tags"].get("name", "Unnamed Road"),
                 "road_type": road["tags"].get("highway", "Unknown"),
                 "osm_speed_limit": parsed_speed_limit,
+                "mapillary_speed_limit": -1.0,
                 "distance_meters": round(distance, 2),
                 "geometry": road["geometry"],
                 "bounds": road["bounds"],
-                "mapillary_speed_limit": -1.0,
-                "mapquest_speed_limit": -1.0   
             }
             
     return closest_road
@@ -548,52 +480,82 @@ def convert_points_for_speeding_events(geocode_to_segment, travelled_segments):
     for (lat, lon, distracted, traveling_speed, timestamp), segment_data in geocode_to_segment.items():
         segment_id = segment_data['segment_id']
         segment = travelled_segments[segment_id]
-        osm_speed_limit = segment['osm_speed_limit'] if segment['osm_speed_limit'] and segment['osm_speed_limit'] != 'Unknown' else 0
-        mapillary_speed_limit = segment['mapillary_speed_limit'] if segment['mapillary_speed_limit'] > 0 else 0
-        mapquest_speed_limit = (
-            segment['mapquest_speed_limit']
-            if isinstance(segment['mapquest_speed_limit'], (int, float)) and segment['mapquest_speed_limit'] > 0
-            else 0
-        )
-        speed_limit_sources = [osm_speed_limit, mapillary_speed_limit, mapquest_speed_limit]
-        valid_posted_speed_limit = next((speed_limit for speed_limit in speed_limit_sources if speed_limit != 0), 0)
+        avg_segment_traveling_speed = segment.get('avg_traveling_speed', 0)
+        avg_speed_deviation = segment.get('avg_speed_deviation', 0)
+        driver_speed_deviation = normalize_decimal(traveling_speed) - normalize_decimal(avg_segment_traveling_speed) + normalize_decimal(avg_speed_deviation)
 
         result.append({
             'lat': lat,
             'long': lon,
             'distracted': bool(distracted),
-            'speed': traveling_speed,
-            'limit': valid_posted_speed_limit,
+            'speed': normalize_decimal(traveling_speed),
+            'segment_id': segment_id,
+            'avg_segment_traveling_speed': avg_segment_traveling_speed,
+            'avg_speed_deviation': avg_speed_deviation,
+            'driver_speed_deviation': driver_speed_deviation,
             'road_type': segment['road_type'],
             'timestamp': timestamp
         })
+
     return result
 
 def driven_defined_speeding_events(points, config=None):
     # Use config for threshold and duration if provided, else default to 10 mph and 5 seconds
-    threshold = 10
+    threshold = normalize_decimal(10.0)
     duration = 5
     if config is not None:
-        threshold = int(config.get('EXCESS_SPEED_THRESHOLD_MPH', 10))
+        threshold = normalize_decimal(config.get('EXCESS_SPEED_THRESHOLD_MPH', 10.0))
         duration = int(config.get('EXCESS_SPEED_DURATION_SECONDS', 5))
+
     speeding_events = []
     current_event = []
-    speeding_event_counter = 0
     start_time = None
+
     for point in points:
-        excess_speed = point['speed'] - point['limit']
-        if excess_speed >= threshold and point['limit'] > 0:
+        driver_speed_deviation = point['driver_speed_deviation']
+        print("Driver Speed Deviation: ", driver_speed_deviation)
+        print("Point Data: ", point, "\n")
+
+        if driver_speed_deviation >= threshold and point['avg_segment_traveling_speed'] > 0 and point['speed'] > driver_speed_deviation:
             if not current_event:
                 start_time = point['timestamp']
             current_event.append(point)
         else:
-            if current_event and start_time is not None and (current_event[-1]['timestamp'] - start_time) >= duration:
-                speeding_events.append(current_event.copy())
-                speeding_event_counter += 1
+            # Check if the event meets the minimum duration requirement
+            if current_event and start_time is not None:
+                end_time = current_event[-1]['timestamp']
+                if (end_time - start_time) >= duration:
+                    speeding_events.append({
+                        'event_id': f'speeding_{len(speeding_events)}',
+                        'start_time': start_time,
+                        'end_time': end_time,
+                        'duration': end_time - start_time,
+                        'start_speed': current_event[0]['speed'],
+                        'end_speed': current_event[-1]['speed'],
+                        'driver_speed_deviation_start': current_event[0]['driver_speed_deviation'],
+                        'driver_speed_deviation_end': current_event[-1]['driver_speed_deviation'],
+                        'road_type': current_event[0]['road_type'],
+                        'points': current_event.copy()
+                    })
+            # Reset for the next event
             current_event = []
             start_time = None
-    if current_event and start_time is not None and (current_event[-1]['timestamp'] - start_time) >= duration:
-        speeding_events.append(current_event)
+    # Handle case where final event reaches the end of the dataset
+    if current_event and start_time is not None:
+        end_time = current_event[-1]['timestamp']
+        if (end_time - start_time) >= duration:
+            speeding_events.append({
+                'event_id': f'speeding_{len(speeding_events)}',
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration': end_time - start_time,
+                'start_speed': current_event[0]['speed'],
+                'end_speed': current_event[-1]['speed'],
+                'driver_speed_deviation_start': current_event[0]['driver_speed_deviation'],
+                'driver_speed_deviation_end': current_event[-1]['driver_speed_deviation'],
+                'road_type': current_event[0]['road_type'],
+                'points': current_event
+            })
     return speeding_events
 
 # Function to process the input file and detect speeding events
@@ -612,24 +574,27 @@ def process_data_file(input_file, config):
     reading_file_end_time = time.time()
     elapsed_reading_file_time = reading_file_end_time - reading_file_start_time
     
+    total_points = len(points)
+    batch_start = 0
+    osm_api_call = 0
+    batch_size = config.get('BATCH_SIZE', 20)
 
     mapillary_api_call_start_time = time.time()
-    # DEV NOTE: Might need to batch this call if too big of bounding box
-    speed_signs = get_mapillary_speed_limits(session_lat_min, session_lon_min, session_lat_max, session_lon_max, config)
+    # DEV NOTE: Will need to optimize + build for scale when using Mapillary service
+    mapillary_speed_signs = get_mapillary_speed_limits(session_lat_min, session_lon_min, session_lat_max, session_lon_max, config)
 
     mapillary_api_call_end_time = time.time()
     elapsed_mapillary_api_call_time = mapillary_api_call_end_time - mapillary_api_call_start_time
 
 
     # Track unique travelled segments across all batches
+    determine_travelled_segments_start_time = time.time()
+
     travelled_segments = {}
     geocode_to_segment = {}
-    total_points = len(points)
-    batch_start = 0
-    osm_api_call = 0
-    batch_size = config.get('BATCH_SIZE', 20)
+    # Track sum + count of speeds per segment
+    segment_traveling_speed_stats = {} 
 
-    determine_travelled_segments_start_time = time.time()
     while batch_start < total_points:
         batch_end = min(batch_start + batch_size, total_points)
         batch = points[batch_start:batch_end]
@@ -644,106 +609,184 @@ def process_data_file(input_file, config):
             
             if nearest_road:
                 segment_id = str(nearest_road['id'])
+
                 if segment_id not in travelled_segments:
                     travelled_segments[segment_id] = nearest_road
+
+                # Track the mapping of driving data point to road segment
                 geocode_to_segment[(lat, lon, distracted, traveling_speed, timestamp)] = {
                     "segment_id": segment_id,
                     "distance_meters": nearest_road['distance_meters']
                 }
 
+                if segment_id not in segment_traveling_speed_stats:
+                    segment_traveling_speed_stats[segment_id] = {"traveling_speed_sum": 0.0, "count": 0}
+
+                segment_traveling_speed_stats[segment_id]["traveling_speed_sum"] += traveling_speed
+                segment_traveling_speed_stats[segment_id]["count"] += 1
+
         batch_start += batch_size
 
+    # Calculate average driver traveling speed for each road segment
+    for segment_id, stats in segment_traveling_speed_stats.items():
+        traveling_speed_sum = stats["traveling_speed_sum"]
+        count = stats["count"]
+        avg_traveling_speed = traveling_speed_sum / count if count > 0 else 0
+
+        travelled_segments[segment_id]["driver_avg_traveling_speed"] = normalize_decimal(avg_traveling_speed)
+
     filtered_geocode_to_segment, removed_segments, unique_segments_count = count_segment_occurrences(geocode_to_segment)
-    
-    # Determine True Speeding Events
-    speeding_event_points = convert_points_for_speeding_events(geocode_to_segment, travelled_segments)
-    grouped_events = driven_defined_speeding_events(speeding_event_points, config)
 
     # Check and update road segment history for 21-day tracking
     road_history_start_time = time.time()
 
     user_id = str(config.get('USER_ID', "31399")) 
     history_stats = check_and_update_user_segment_history(travelled_segments, user_id, config)
-
+    
     road_history_end_time = time.time()
     elapsed_road_history_time = road_history_end_time - road_history_start_time
 
     road_types_travelled = determine_road_types_travelled(travelled_segments, config)
-
     determine_travelled_segments_end_time = time.time()
     elapsed_determine_travelled_segments = determine_travelled_segments_end_time - determine_travelled_segments_start_time
 
     resolve_speed_limits_start_time = time.time()
-
     segment_ids = list(travelled_segments.keys())
     db_existing_segments = batch_get_items(segment_ids, config)
     db_items_to_write = []
 
     mapquest_api_counter = 0
-    segments_with_unknown_speeds = 0
+    segments_with_unknown_osm_speeds = 0
     updated_at_timestamp = int(time.time())
 
-    # Resolve speed limits for all travelled segments
+    # Process all traveled road segments
     for segment_id, road in travelled_segments.items():
+        # Need to use average traveling speed because individual points have varying speeds
+        driver_avg_traveling_speed = normalize_decimal(road['driver_avg_traveling_speed'])
+        # Only process segments that passed geocode filtering
         if segment_id in filtered_geocode_to_segment:
+            # ---------------------------------------------
+            # CASE 1: EXISTING SEGMENT IN DATABASE
+            # ---------------------------------------------
             if segment_id in db_existing_segments:
                 # Use existing record data
                 item = db_existing_segments[segment_id]
-                road['osm_speed_limit'] = float(item.get('osm_speed_limit', Decimal(0)))
-                road['mapillary_speed_limit'] = float(item.get('mapillary_speed_limit', Decimal(0)))
-                road['mapquest_speed_limit'] = float(item.get('mapquest_speed_limit', Decimal(0)))
-                
+
+                db_item_avg_traveling_speed = normalize_decimal(item.get('avg_traveling_speed', normalize_decimal(0)))
+                db_item_avg_speed_deviation = normalize_decimal(item.get('avg_speed_deviation', normalize_decimal(0)))
+                db_item_original_drive_count = int(item.get('drive_count', 0))
+
+                current_avg_driver_speed_deviation = driver_avg_traveling_speed - db_item_avg_traveling_speed + db_item_avg_speed_deviation
+
+                updated_drive_count = db_item_original_drive_count + 1
+
+                # Update running averages
+                updated_avg_traveling_speed = ((db_item_avg_traveling_speed * db_item_original_drive_count) + driver_avg_traveling_speed) / updated_drive_count
+                updated_avg_speed_deviation = ((db_item_avg_speed_deviation * db_item_original_drive_count) + current_avg_driver_speed_deviation) / updated_drive_count
+
+                # Store updated values back into road object
+                road['avg_traveling_speed'] = updated_avg_traveling_speed
+                road['avg_speed_deviation'] = updated_avg_speed_deviation
+
+                # Prepare updated DynamoDB item
+                updated_item = {
+                    "road_segment_id": segment_id,
+                    "osm_road_name": item.get("osm_road_name"),
+                    "osm_road_type": item.get("osm_road_type"),
+                    "avg_traveling_speed": normalize_decimal(str(updated_avg_traveling_speed)),
+                    "avg_speed_deviation": normalize_decimal(str(updated_avg_speed_deviation)),
+                    "drive_count": updated_drive_count,
+                    "updated_at": updated_at_timestamp,
+                    "avg_contextual_speed_30_day": item.get("avg_contextual_speed_30_day", normalize_decimal(0)),
+                    "avg_contextual_speed_60_day": item.get("avg_contextual_speed_60_day", normalize_decimal(0)),
+                    "avg_contextual_speed_180_day": item.get("avg_contextual_speed_180_day", normalize_decimal(0)),
+                }
+
+                db_items_to_write.append({"PutRequest": {"Item": updated_item}})
+            # ---------------------------------------------
+            # CASE 2: NEW SEGMENT (NOT IN DATABASE)
+            # ---------------------------------------------
             else:
-                speed_limit = road['osm_speed_limit']
+                road['avg_traveling_speed'] = driver_avg_traveling_speed
+                road['avg_speed_deviation'] = normalize_decimal(0)
+
+                # Normalize OSM speed limit
+                osm_speed_limit = road.get("osm_speed_limit")
+                osm_speed_limit_is_unknown = (osm_speed_limit == "Unknown")
+
+                # Convert OSM speed limit to normalize_decimal if numeric
+                if isinstance(osm_speed_limit, (int, float)):
+                    osm_speed_limit = normalize_decimal(str(osm_speed_limit))
+                elif osm_speed_limit_is_unknown:
+                    osm_speed_limit = normalize_decimal(0)
+
                 road_segment_info = {
                     "road_segment_id": segment_id,
                     "osm_road_name": road['road_name'],
                     "osm_road_type": road['road_type'],
-                    "osm_speed_limit": Decimal(str(speed_limit)) if isinstance(speed_limit, (int, float)) else speed_limit,
-                    "mapillary_speed_limit": Decimal(0),
-                    "mapquest_speed_limit": Decimal(0),
-                    "avg_contextual_speed_30_day": Decimal(0), 
-                    "avg_contextual_speed_60_day": Decimal(0), 
-                    "avg_contextual_speed_180_day": Decimal(0),
+                    "avg_traveling_speed": driver_avg_traveling_speed, # Use current driver's avg traveling speed because it is the 1st entry in the table
+                    "avg_speed_deviation": normalize_decimal(0),
+                    "drive_count": int(1),
+                    "avg_contextual_speed_30_day": normalize_decimal(0), 
+                    "avg_contextual_speed_60_day": normalize_decimal(0), 
+                    "avg_contextual_speed_180_day": normalize_decimal(0),
                     "updated_at": updated_at_timestamp  
                 }
                 
-                if speed_limit == "Unknown": # Speed Limit from OSM is not present
-                    road['osm_speed_limit'] = 0
-                    road_segment_info['osm_speed_limit'] = Decimal(0)
+                # -------------------------------------------------------
+                # If OSM speed limit is UNKNOWN → check Mapillary → then MapQuest
+                # -------------------------------------------------------
+                if osm_speed_limit_is_unknown: # Speed Limit from OSM is not present
+                    segments_with_unknown_osm_speeds += 1
+                    road["osm_speed_limit"] = 0  # normalize stored value
                     
-                    segments_with_unknown_speeds += 1
                     # Check Mapillary
-                    segment_with_mapillary_speed = map_speed_sign_to_nearest_road(road, speed_signs)
-                    if len(segment_with_mapillary_speed['mapillary_speed_signs']) > 0: # speed sign mapped to road
-                        speed_limit = segment_with_mapillary_speed['mapillary_speed_signs'][0]['speed_limit']
-                        road['mapillary_speed_limit'] = speed_limit  # for printing to console
-                        road_segment_info['mapillary_speed_limit'] = Decimal(speed_limit)
+                    mapillary_result = map_speed_sign_to_nearest_road(road, mapillary_speed_signs)
+                    mapillary_signs = mapillary_result.get("mapillary_speed_signs", [])
+
+                    if mapillary_signs:
+                        mapillary_speed_limit = normalize_decimal(mapillary_signs[0]["speed_limit"])
+                        driver_speed_deviation = driver_avg_traveling_speed - mapillary_speed_limit
+
+                        road_segment_info["avg_speed_deviation"] = driver_speed_deviation
+                        road['avg_speed_deviation'] = driver_speed_deviation
+
                     else:
-                        # Call MapQuest if still unknown
-                        mid_index = len(road['geometry']) // 2  # Get the middle index
+                        # Call MapQuest if still unknown - should only need to do this once per segment
+
+                        mid_index = len(road['geometry']) // 2
                         middle_road_coord = (road['geometry'][mid_index]['lat'], road['geometry'][mid_index]['lon'])
-                        speed_limit = get_mapquest_speed_limit(middle_road_coord, config)
+
+                        mapquest_speed_limit = get_mapquest_speed_limit(middle_road_coord, config)
                         mapquest_api_counter += 1
-                        road['mapquest_speed_limit'] = speed_limit  # for printing to console
-                        if speed_limit != "Unknown":
-                            road_segment_info['mapquest_speed_limit'] = Decimal(speed_limit)
-                        else:
-                            road_segment_info['mapquest_speed_limit'] = Decimal(0)
-                    road_segment_info['osm_speed_limit'] = Decimal(0)
+
+                    
+                        if mapquest_speed_limit != "Unknown":
+                            mapquest_speed_limit = normalize_decimal(mapquest_speed_limit)
+                            driver_speed_deviation = driver_avg_traveling_speed - mapquest_speed_limit
+
+                            road_segment_info["avg_speed_deviation"] = driver_speed_deviation
+                            road['avg_speed_deviation'] = driver_speed_deviation
+                
+                else:
+                    driver_speed_deviation = driver_avg_traveling_speed - osm_speed_limit
+
+                    road_segment_info['avg_speed_deviation'] = driver_speed_deviation
+                    road['avg_speed_deviation'] = driver_speed_deviation
 
                 db_items_to_write.append({"PutRequest": {"Item": road_segment_info}})
                 # Write in batches
+            
                 if len(db_items_to_write) == batch_size:
                     batch_write_all(config.get('DYNAMODB_ROAD_SEGMENT_TABLE', 'drivenDB_road_segment_info'), db_items_to_write, config)
                     db_items_to_write = []  # Reset batch
-        # else:
-        #     # print(f"Segment ID {segment_id} not found in geocode_to_segment_counter")
-    # print(f"# of Items to write to DB: {len(db_items_to_write)}")
-    # print(f"Items Content: {db_items_to_write}")
-                 
+
     if db_items_to_write:
         batch_write_all(config.get('DYNAMODB_ROAD_SEGMENT_TABLE', 'drivenDB_road_segment_info'), db_items_to_write, config)
+
+    # Determine True Speeding Events
+    speeding_event_points = convert_points_for_speeding_events(geocode_to_segment, travelled_segments)
+    grouped_events = driven_defined_speeding_events(speeding_event_points, config)
 
     resolve_speed_limits_end_time = time.time()
     elapsed_resolve_speed_limits = resolve_speed_limits_end_time - resolve_speed_limits_start_time
@@ -752,41 +795,36 @@ def process_data_file(input_file, config):
 
     speeding_records = []
 
-    # Output user geocode results
+    # Generate speeding records for contextualize speeds
     for (lat, lon, distracted, traveling_speed, timestamp), segment_data in geocode_to_segment.items():
         segment_id = segment_data['segment_id']
-        distance_meters = segment_data['distance_meters']
         segment = travelled_segments[segment_id]
-        # print(segment)
-        osm_speed_limit = segment['osm_speed_limit'] if segment['osm_speed_limit'] and segment['osm_speed_limit'] != 'Unknown' else 0
-        mapillary_speed_limit = segment['mapillary_speed_limit'] if segment['mapillary_speed_limit'] > 0 else 0
-        mapquest_speed_limit = (
-            segment['mapquest_speed_limit']
-            if isinstance(segment['mapquest_speed_limit'], (int, float)) and segment['mapquest_speed_limit'] > 0
-            else 0
-        )
+        
+        traveling_speed_dec = normalize_decimal(traveling_speed)
+        avg_traveling_speed = normalize_decimal(segment['driver_avg_traveling_speed'])
+        avg_speeding_deviation = normalize_decimal(segment.get('avg_speed_deviation', 0))
 
-        speed_limit_sources = [osm_speed_limit, mapillary_speed_limit, mapquest_speed_limit]
-        valid_posted_speed_limit = next((speed_limit for speed_limit in speed_limit_sources if speed_limit != 0), Decimal(0))  
+        driver_speed_deviation = traveling_speed_dec - avg_traveling_speed + avg_speeding_deviation
 
-        if traveling_speed > valid_posted_speed_limit and valid_posted_speed_limit > 0:
+        fractional = driver_speed_deviation - int(driver_speed_deviation)
+
+        if fractional < normalize_decimal(0.50):
+            driver_speed_deviation = driver_speed_deviation.quantize(Decimal(1), rounding=ROUND_DOWN)
+        else:
+            driver_speed_deviation = driver_speed_deviation.quantize(Decimal(1), rounding=ROUND_UP)
+
+        # Positive deviation indicates speeding
+        if driver_speed_deviation > 0:
             speeding_records.append({
                 "PutRequest": {
                     "Item": {
                         "road_segment_id": str(segment['id']),
-                        "timestamp#user_id": f"{str(timestamp)}#{str(user_id)}",
-                        "traveling_speed": Decimal(traveling_speed),
-                        "posted_speed_limit": Decimal(valid_posted_speed_limit)
+                        "timestamp#user_id": f"{timestamp}#{user_id}",
+                        "traveling_speed": traveling_speed_dec,
+                        "speed_deviation": driver_speed_deviation 
                     }
                 }
             })
-
-        # write_speed_data_to_file(
-        #     "speed_data.txt",
-        #     lat, lon, distracted, traveling_speed,
-        #     osm_speed_limit, mapillary_speed_limit, mapquest_speed_limit,
-        #     segment["road_type"], timestamp
-        # )
 
     if speeding_records:
         batch_write_all(config.get('DYNAMODB_SPEEDING_EVENTS_TABLE', 'users_speeding_events'), speeding_records, config)
@@ -802,19 +840,16 @@ def process_data_file(input_file, config):
         'speeding_records': speeding_records,
         'grouped_events': grouped_events,
         'geocode_to_segment': geocode_to_segment,
-        'travelled_segments': travelled_segments,
+        'travelled_segments': travelled_segments, 
         'road_history_stats': history_stats,
         'road_types_travelled': road_types_travelled,
         'metrics': {
             'user_geocodes': len(points),
             'travelled_segments': len(travelled_segments),
-            'unique_segments': unique_segments_count,
-            'filtered_segments': len(filtered_geocode_to_segment),
-            'removed_segments': len(removed_segments),
             'speeding_records': len(speeding_records),
-            'unknown_speeds': segments_with_unknown_speeds,
+            'unknown_speeds': segments_with_unknown_osm_speeds,
             'osm_api_calls': osm_api_call,
-            'mapillary_speed_signs': len(speed_signs),
+            'mapillary_speed_signs': len(mapillary_speed_signs),
             'mapquest_api_calls': mapquest_api_counter,
             'timings': {
                 'reading_file': elapsed_reading_file_time,
