@@ -1,8 +1,6 @@
 import argparse
-from datetime import datetime
-import pytz
-import os
-import time
+from datetime import datetime, timezone
+from helper_functions import convert_utc_offset_to_hours, local_to_utc_hour
 
 def parse_points(input_file):
     """
@@ -45,8 +43,12 @@ def detect_night_driving_events(input_file, config=None):
         dict: Dictionary containing late night driving statistics
     """
 
-    lower_bound_drive_hour = int(config.get('LOWER_BOUND_DRIVE_HOUR', 0))
-    upper_bound_drive_hour = int(config.get('UPPER_BOUND_DRIVE_HOUR', 4))
+    lower_bound = config.get("LOWER_BOUND_DRIVE_HOUR", 0)
+    upper_bound = config.get("UPPER_BOUND_DRIVE_HOUR", 4)
+    utc_offset_str = config.get('UTC_OFFSET', '-05:00:00')
+    offset_hours = convert_utc_offset_to_hours(utc_offset_str)
+    night_lower_utc = local_to_utc_hour(lower_bound, offset_hours)
+    night_upper_utc = local_to_utc_hour(upper_bound, offset_hours)
 
     try:
         # Parse points from the input file
@@ -60,22 +62,6 @@ def detect_night_driving_events(input_file, config=None):
                 'night_driving_points': 0
             }
         
-        # Automatically detect the local timezone
-        try:
-            
-            # Try to get the system timezone using datetime.now().astimezone()
-            local_dt = datetime.now()
-            local_tz = local_dt.astimezone().tzinfo
-            timezone = local_tz
-            
-            # Get timezone string for display
-            timezone_str = str(timezone)
-            
-        except Exception as e:
-            print(f"Warning: Could not detect local timezone: {e}, using UTC")
-            timezone = pytz.UTC
-            timezone_str = 'UTC'
-        
         night_driving_seconds = 0
         night_driving_points = 0
         total_points = len(points)
@@ -85,11 +71,9 @@ def detect_night_driving_events(input_file, config=None):
             timestamp = point['timestamp']
             
             # Convert Unix timestamp to datetime in the local timezone
-            dt_utc = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
-            dt_local = dt_utc.astimezone(timezone)
-            
-            hour = dt_local.hour
-            if lower_bound_drive_hour <= hour < upper_bound_drive_hour: 
+            hour_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc).hour 
+
+            if night_lower_utc <= hour_utc < night_upper_utc: 
                 night_driving_points += 1
                 
                 # Calculate seconds for this point
@@ -111,9 +95,7 @@ def detect_night_driving_events(input_file, config=None):
             'total_night_driving_hours': round(night_driving_seconds / 3600, 2),
             'total_points': total_points,
             'night_driving_points': night_driving_points,
-            'night_driving_percentage': round((night_driving_points / total_points) * 100, 2) if total_points > 0 else 0,
-            'timezone': timezone_str,
-            'timezone_used': str(timezone)
+            'night_driving_percentage': round((night_driving_points / total_points) * 100, 2) if total_points > 0 else 0
         }
         
     except Exception as e:
@@ -163,7 +145,6 @@ def main():
         print("="*50)
         print("LATE NIGHT DRIVING EVENTS (12 AM - 4 AM)")
         print("="*50)
-        print(f"Timezone: {results['timezone_used']}")
         print(f"Total Night Driving Time: {results['total_night_driving_seconds']} seconds")
         print(f"Total Night Driving Time: {results['total_night_driving_minutes']} minutes")
         print(f"Total Night Driving Time: {results['total_night_driving_hours']} hours")
