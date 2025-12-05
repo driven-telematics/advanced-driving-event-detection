@@ -7,12 +7,15 @@ import json
 from geopy.distance import geodesic
 from datetime import datetime
 from dotenv import load_dotenv
+from calculate_driving_score import calculate_driving_score, detect_overlapping_events
 from detect_speeding_events import detect_speeding_records
 from detect_cornering_events import detect_cornering_events_wrapper
 from detect_accel_decel_events import detect_accel_decel_events_wrapper
 from detect_distracted_events import detect_distracted_events
 from detect_night_driving_events import detect_night_driving_events_wrapper
 from decimal import Decimal
+
+from helper_functions import convert_seconds, write_dict_to_json
 
 # Load environment variables from .env file
 load_dotenv()
@@ -77,6 +80,62 @@ def get_config():
         'CLASSIFICATION': os.environ.get('CLASSIFICATION', 'car'),
         'DRIVE_ID': os.environ.get('DRIVE_ID', '20251021/12300_12300_00001'),
         'DEVICE_ID': os.environ.get('DEVICE_ID', 'CEE06157DECA4099'),
+    }
+    
+    # --- Base Penalty Values ---
+    config['penalty_values'] = {
+        'distracted': float(os.environ.get('PENALTY_DISTRACTED', '26.0')),
+        'speeding': float(os.environ.get('PENALTY_SPEEDING', '26.0')),
+        'hard_braking': float(os.environ.get('PENALTY_HARD_BRAKING', '600.0')),
+        'rapid_acceleration': float(os.environ.get('PENALTY_RAPID_ACCELERATION', '600.0')),
+        'cornering': float(os.environ.get('PENALTY_CORNERING', '1200.0')),
+        'night_driving': float(os.environ.get('PENALTY_NIGHT_DRIVING', '2.0')),
+        'road_familiarity': float(os.environ.get('PENALTY_ROAD_FAMILIARITY', '1.05')),
+        'road_type': float(os.environ.get('PENALTY_ROAD_TYPE', '1.05')),
+    }
+
+    config['speeding_thresholds'] = {
+        'max_allowed_speed_threshold': float(os.environ.get('MAX_ALLOWED_SPEED_THRESHOLD', '55.0')),
+        'severe_speed_threshold': float(os.environ.get('SEVERE_SPEED_THRESHOLD', '20.0')),
+    }
+
+    # --- Behavior Factors ---
+    config['behavior_factors'] = {
+        'distracted': {
+            'speeding_over_threshold': float(os.environ.get('BF_DISTRACTED_SPEEDING_OVER_THRESHOLD', '2.5')),
+            'hard_braking': float(os.environ.get('BF_DISTRACTED_HARD_BRAKING', '2.0')),
+            'night_driving': float(os.environ.get('BF_DISTRACTED_NIGHT_DRIVING', '3.0')),
+        },
+        'speeding': {
+            'distracted': float(os.environ.get('BF_SPEEDING_DISTRACTED', '2.5')),
+            'hard_braking': float(os.environ.get('BF_SPEEDING_HARD_BRAKING', '2.0')),
+            'night_driving': float(os.environ.get('BF_SPEEDING_NIGHT_DRIVING', '2.5')),
+            'excess_speeding': float(os.environ.get('BF_SPEEDING_EXCESS_SPEEDING', '2.5')),
+        },
+        'hard_braking': {
+            'distracted': float(os.environ.get('BF_HARD_BRAKING_DISTRACTED', '2.0')),
+            'speeding': float(os.environ.get('BF_HARD_BRAKING_SPEEDING', '2.0')),
+            'night_driving': float(os.environ.get('BF_HARD_BRAKING_NIGHT_DRIVING', '2.5')),
+        },
+        'rapid_acceleration': {
+            'speeding': float(os.environ.get('BF_RAPID_ACCELERATION_SPEEDING', '1.5')),
+            'night_driving': float(os.environ.get('BF_RAPID_ACCELERATION_NIGHT_DRIVING', '3.0')),
+        },
+        'cornering': {
+            'night_driving': float(os.environ.get('BF_CORNERING_NIGHT_DRIVING', '3.0')),
+        }
+    }
+
+    # --- Weights ---
+    config['weights'] = {
+        'distracted': float(os.environ.get('WEIGHT_DISTRACTED', '0.38')),
+        'speeding': float(os.environ.get('WEIGHT_SPEEDING', '0.25')),
+        'hard_braking': float(os.environ.get('WEIGHT_HARD_BRAKING', '0.18')),
+        'rapid_acceleration': float(os.environ.get('WEIGHT_RAPID_ACCELERATION', '0.08')),
+        'cornering': float(os.environ.get('WEIGHT_CORNERING', '0.04')),
+        'night_driving': float(os.environ.get('WEIGHT_NIGHT_DRIVING', '0.04')),
+        'road_familiarity': float(os.environ.get('WEIGHT_ROAD_FAMILIARITY', '0.015')),
+        'road_type': float(os.environ.get('WEIGHT_ROAD_TYPE', '0.015')),
     }
 
     if not config['ENABLE_SPEEDING']:
@@ -213,11 +272,7 @@ def print_speeding_records(results):
         
         osm_speed_limit = segment['osm_speed_limit'] if segment['osm_speed_limit'] and segment['osm_speed_limit'] != 'Unknown' else 0
         mapillary_speed_limit = segment['mapillary_speed_limit'] if segment['mapillary_speed_limit'] > 0 else 0
-        mapquest_speed_limit = (
-            segment['mapquest_speed_limit']
-            if isinstance(segment['mapquest_speed_limit'], (int, float)) and segment['mapquest_speed_limit'] > 0
-            else 0
-        )
+        segment_average_speed = segment['avg_traveling_speed'] if segment['avg_traveling_speed'] > 0 else 0
 
         print(f"⏱️  Timestamp: {convert_timestamp(timestamp, 'strftime')}")
         print(f"📍 Location: {lat}, {lon}")
@@ -227,18 +282,11 @@ def print_speeding_records(results):
         print(f"🚧  Road Type: {segment['road_type']}")
         print(f"🚦 OSM Speed Limit: {osm_speed_limit} mph")
         print(f"🚦 Mapillary Speed Limit: {mapillary_speed_limit} mph")
-        print(f"🚦 MapQuest Speed Limit: {mapquest_speed_limit} mph")
+        print(f"🚦 Average Segment Traveling Speed: {segment_average_speed} mph")
         print(f"🚗 Traveling Speed: {traveling_speed} mph\n")
     
+def print_speeding_service_metrics(metrics):
     # Print metrics
-    metrics = results.get('metrics', {})
-    print("======= SPEEDING RECORDS METRICS =======")
-    print(f"# of User Geocodes: {metrics.get('user_geocodes', 0)}")
-    print(f"# of travelled road segments: {metrics.get('travelled_segments', 0)}")
-    print(f"# of Unique Segments: {metrics.get('unique_segments', 0)}")
-    print(f"# of Segments where geocode > 5: {metrics.get('filtered_segments', 0)}")
-    print(f"# of Segments Ignored (geocode < 5): {metrics.get('removed_segments', 0)}")
-    print(f"# of Speeding Records (travelling > speed sign): {metrics.get('speeding_records', 0)}")
     print("======= PERFORMANCE METRICS =======")
     print(f"# of segments with unknown speeds: {metrics.get('unknown_speeds', 0)}")
     print(f"# of OSM API calls: {metrics.get('osm_api_calls', 0)}")
@@ -257,20 +305,23 @@ def print_grouped_speeding_events(grouped_events):
     print("\n======= GROUPED SPEEDING EVENTS (10+ mph over for 5+ seconds) =======")
     print("\n Total Speeding Events Detected:", len(grouped_events))
     for idx, event in enumerate(grouped_events, 1):
-        start = event[0]
-        end = event[-1]
-        duration = end['timestamp'] - start['timestamp']
         print(f"Event {idx}:")
-        print(f"  Start Time: {datetime.fromtimestamp(start['timestamp'])}")
-        print(f"  End Time: {datetime.fromtimestamp(end['timestamp'])}")
-        print(f"  Duration: {duration} seconds")
-        print(f"  Road Type: {start['road_type']}")
-        print(f"  Start Speed: {start['speed']} mph, Limit: {start['limit']} mph")
-        print(f"  End Speed: {end['speed']} mph, Limit: {end['limit']} mph")
+        print(f"  Start Time: {datetime.fromtimestamp(event['start_time'])}")
+        print(f"  End Time: {datetime.fromtimestamp(event['end_time'])}")
+        print(f"  Duration: {event['duration']} seconds")
+        print(f"  Road Type: {event['road_type']}")
+        print(f"  Start Speed: {event['start_speed']} mph")
+        print(f"  End Speed: {event['end_speed']} mph")
+        print(f"  Start Speed Deviation: {event['driver_speed_deviation_start']} mph")
+        print(f"  End Speed Deviation: {event['driver_speed_deviation_end']} mph")
         print(f"  # Points: {len(event)}")
         print("  Details:")
-        for point in event:
-            print(f"    Time: {datetime.fromtimestamp(point['timestamp'])}, Speed: {point['speed']} mph, Limit: {point['limit']} mph, Road Type: {point['road_type']}, Location: ({point['lat']}, {point['long']})")
+        for point in event['points']:
+            print(f"    Time: {datetime.fromtimestamp(point['timestamp'])}, Speed: {point['speed']} mph, Road Type: {point['road_type']}, Location: ({point['lat']}, {point['long']})")
+            print(f"    Segment Traveled On: {point['segment_id']}")
+            print(f"    Avg Segment Traveling Speed: {point['avg_segment_traveling_speed']} mph")
+            print(f"    Avg Segment Speed Deviation: {point['avg_speed_deviation']} mph")
+            print(f"    Driver Speed Deviation: {point['driver_speed_deviation']} mph")
         print("-" * 50)
 
 def print_cornering_events(events):
@@ -330,7 +381,6 @@ def print_night_driving_events(night_driving_results):
     print("\n" + "="*50)
     print("NIGHT DRIVING EVENTS (12 AM - 4 AM)")
     print("="*50)
-    print(f"Timezone: {night_driving_results['timezone_used']}")
     print(f"Total Night Driving Time: {night_driving_results['total_night_driving_seconds']} seconds")
     print(f"Total Night Driving Time: {night_driving_results['total_night_driving_minutes']} minutes")
     print(f"Total Night Driving Time: {night_driving_results['total_night_driving_hours']} hours")
@@ -529,24 +579,16 @@ def extract_waypoints_from_results(results):
         for (lat, lon, distracted, traveling_speed, timestamp), segment_data in geocode_to_segment.items():
             segment_id = segment_data['segment_id']
             segment = travelled_segments[segment_id]
-            
-            # Get speed limits from different sources
-            osm_speed_limit = segment['osm_speed_limit'] if segment['osm_speed_limit'] and segment['osm_speed_limit'] != 'Unknown' else 0
-            mapillary_speed_limit = segment['mapillary_speed_limit'] if segment['mapillary_speed_limit'] > 0 else 0
-            mapquest_speed_limit = (
-                segment['mapquest_speed_limit']
-                if isinstance(segment['mapquest_speed_limit'], (int, float)) and segment['mapquest_speed_limit'] > 0
-                else 0
-            )
+            segment_avg_traveling_speed = segment.get('avg_traveling_speed', 0)
+            segment_avg_speed_deviation = segment.get('avg_speed_deviation', 0)
             
             waypoint = {
                 "lat": lat,
                 "lon": lon,
                 "timestamp": timestamp,
                 "traveling_speed_mph": traveling_speed,
-                "speed_limit_source_1": osm_speed_limit,      # OSM speed limit
-                "speed_limit_source_2": mapillary_speed_limit, # Mapillary speed limit
-                "speed_limit_source_3": mapquest_speed_limit,   # MapQuest speed limit
+                "segment_avg_traveling_speed": segment_avg_traveling_speed,
+                "segment_avg_speed_deviation": segment_avg_speed_deviation,
                 "road_name": segment.get('road_name', 'Unknown'),
                 "road_type": segment.get('road_type', 'Unknown'),
                 "distance_meters": segment_data.get('distance_meters', 0)
@@ -596,24 +638,18 @@ def format_events_for_summary(results, config):
                 for i, event in enumerate(speeding_data['grouped_events']):
                     if not event:
                         continue
-                        
-                    start_event = event[0]
-                    end_event = event[-1]
-                    duration_sec = end_event['timestamp'] - start_event['timestamp'] + 1
                     
                     # Get road history stats
                     road_history_stats = speeding_data.get('road_history_stats', {})
                     
                     event_data = {
                         "event_type": 1,  # speeding
-                        "start_time": convert_timestamp(start_event['timestamp'], 'datetime'),
-                        "end_time": convert_timestamp(end_event['timestamp'], 'datetime'),
-                        "traveling_speed_mph": start_event['speed'],
-                        "speed_limit_mph": start_event['limit'],
-                        "duration_sec": duration_sec,
+                        "start_time": convert_timestamp(event['start_time'], 'datetime'),
+                        "end_time": convert_timestamp(event['end_time'], 'datetime'),
+                        "traveling_speed_mph": event['start_speed'],
+                        "duration_sec": event['duration'],
                         "details": {
-                            "speed_excess_mph": start_event['speed'] - start_event['limit'],
-                            "road_type": start_event.get('road_type', 'Unknown'),
+                            "road_type": event.get('road_type', 'Unknown'),
                         }
                     }
 
@@ -695,8 +731,6 @@ def format_events_for_summary(results, config):
             for event in results['distracted']:
                 event_data = {
                     "event_type": 5,  # distracted_driving
-                    # "start": event['start_idx'],
-                    # "end": event['end_idx'],
                     "start_time": convert_timestamp(event['start_time'], 'datetime'),
                     "end_time": convert_timestamp(event['end_time'], 'datetime'),
                     "duration_sec": event['length']
@@ -713,8 +747,7 @@ def format_events_for_summary(results, config):
                     "total_night_driving_seconds": night_driving_results['total_night_driving_seconds'],
                     "total_night_driving_minutes": night_driving_results['total_night_driving_minutes'],
                     "total_night_driving_hours": night_driving_results['total_night_driving_hours'],
-                    "night_driving_percentage": night_driving_results['night_driving_percentage'],
-                    "timezone_used": night_driving_results['timezone_used']
+                    "night_driving_percentage": night_driving_results['night_driving_percentage']
                 }
                 events.append(event_data)
     
@@ -744,8 +777,6 @@ def generate_trip_summary(results, user_data_points, config, enabled_events):
     # Assign start and end points
     start_point = waypoints[0]
     end_point = waypoints[-1]
-    
-    total_distance, total_seconds = calculate_distance_and_duration(user_data_points)
     
     # Get configuration values from environment
     drive_id = config.get('DRIVE_ID', '')
@@ -822,6 +853,7 @@ def generate_trip_summary(results, user_data_points, config, enabled_events):
         summary.get('distracted_events', 0)
     )
 
+    total_distance, total_seconds = calculate_distance_and_duration(user_data_points)
     
     # Create the trip summary
     trip_summary = {
@@ -946,6 +978,7 @@ def main():
         # Print results for each event type
         if enabled_events['speeding'] and 'speeding' in results and 'error' not in results['speeding']:
             # print_speeding_records(results['speeding']) ## Uncomment to print detailed speeding records for each geocode
+            # print_speeding_service_metrics(results['speeding']['metrics'])
             print_grouped_speeding_events(results['speeding']['grouped_events'])
             if enabled_events['road_familiarity']:
                 print_road_history_stats(results['speeding']['road_history_stats'])
@@ -1029,6 +1062,8 @@ def main():
 
         print(f"\nTotal Events Detected: {total_events}")
         print(f"Total Parallel Processing Time: {total_processing_time:.2f} seconds")
+        if enabled_events['speeding'] and 'speeding' in results and 'error' not in results['speeding']:
+            print_speeding_service_metrics(results['speeding']['metrics'])
         
         # Generate trip summary
         print("\n" + "="*50)
@@ -1037,6 +1072,7 @@ def main():
         
         try:
             trip_summary = generate_trip_summary(results, user_data_points, config, enabled_events)
+            duration_minutes, duration_seconds = convert_seconds(trip_summary.get('duration_seconds', 0))
             if 'error' in trip_summary:
                 print(f"Error generating trip summary: {trip_summary['error']}")
             else:
@@ -1046,6 +1082,7 @@ def main():
                 print(f"Trip Summary Stats:")
                 print(f"  - Drive ID: {trip_summary['driveid']}")
                 print(f"  - Total Distance: {trip_summary['distance_miles']:.2f} miles")
+                print(f"  - Total Duration: {duration_minutes} minutes {duration_seconds} seconds")
                 print(f"  - Total Events: {trip_summary['summary']['total_events']}")
                 if enabled_events['speeding']:
                     print(f"  - Speeding Events: {trip_summary['summary']['speeding_events']}")
@@ -1059,15 +1096,15 @@ def main():
                     print(f"  - Distracted Events: {trip_summary['summary']['distracted_events']}")
                 if enabled_events['night_driving']:
                     print(f"  - Night Driving: {trip_summary['summary']['night_driving_seconds']} seconds")
+
+                # Send Results Dict to Scoring Algorithm for Overlap Detection + Scoring Flow
+                calculate_driving_score(results, config, duration_seconds)
+
         except Exception as e:
             print(f"Error generating trip summary: {str(e)}")
             import traceback
             traceback.print_exc()
-
-
-        # Send Results Dict to Scoring Algorithm for Overlap Detection + Scoring Flow
-
-        
+                    
         
     except FileNotFoundError:
         print(f"Error: Input file '{args.input_file}' not found")

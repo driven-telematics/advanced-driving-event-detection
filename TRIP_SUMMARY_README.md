@@ -9,21 +9,25 @@ The trip summary generation creates a comprehensive JSON file containing all det
 ## Features
 
 ### Event Types (Enum System)
-0: "general_cornering
-1: "speeding",
-2: "hard_braking", 
-3: "rapid_acceleration",
-4: "hard_cornering",
-5: "distracted_driving",
-6: "night_driving_driving"    
+The following event types are supported:
+
+0: "general_cornering"  
+1: "speeding"  
+2: "hard_braking"  
+3: "rapid_acceleration"  
+4: "hard_cornering"  
+5: "distracted_driving"  
+6: "night_driving"  
+7: "road_familiarity"  
+8: "road_type"  
 
 ### Trip Summary Structure
 
 The generated JSON includes:
 
 1. **Trip Metadata**:
-   - Drive ID (auto-generated UUID)
-   - Device ID (auto-generated UUID)
+   - Drive ID (from environment variable)
+   - Device ID (from environment variable)
    - Account ID (from environment variable)
    - UTC offset (from environment variable)
    - Classification (from environment variable)
@@ -48,21 +52,9 @@ The generated JSON includes:
 4. **Comprehensive Summary**: Statistics including:
    - Total events by type
    - Distance and duration
-   - Road segment history
+   - Road segment history (if `road_familiarity` is enabled)
+   - Road types traveled (if `road_type` is enabled)
    - Late night driving time
-
-## Environment Variables
-
-Add these to your `.env` file:
-
-```bash
-# Trip Summary Configuration
-DRIVE_ID=BAF1C5FE-732A-427D-9A88-700AD1B88F47
-DEVICE_ID=E1F2276D-E1F1-4D01-93B7-445AE9076A15
-ACCOUNT_ID=19857054769
-UTC_OFFSET=-04:00:00
-CLASSIFICATION=car
-```
 
 ## Usage
 
@@ -96,7 +88,7 @@ GENERATING TRIP SUMMARY
 ==================================================
 Trip summary saved to: trip_summary_20241201_143022.json
 Trip Summary Stats:
-  - Drive ID: BAF1C5FE-732A-427D-9A88-700AD1B88F47
+  - Drive ID: BAF1C5FE-732A-427D-9A88-123149
   - Total Distance: 11.92 km
   - Total Events: 4
   - Speeding Events: 2
@@ -138,13 +130,24 @@ Each event in the summary includes relevant details:
 - Percentage of trip
 - Timezone used
 
+### Road Familiarity (if enabled)
+- Total segments in the trip
+- Segments driven recently (within 21 days)
+- Segments not driven recently
+- Percentage of segments driven recently
+
+### Road Types (if enabled)
+- Count of road types traveled
+- Breakdown by road type
+
 ## File Structure
 
 The generated JSON follows this structure:
 ```json
 {
   "driveid": "UUID",
-  "distance": 11.92,
+  "distance_miles": 11.92,
+  "duration_seconds": 1020,
   "driving": true,
   "id": 1234567890,
   "deviceid": "UUID",
@@ -160,13 +163,10 @@ The generated JSON follows this structure:
     "lat": 27.949466,
     "lon": -82.444008
   },
-  "idle_sec": 0,
-  "nightdriving_sec": 0,
+  "night_driving_seconds": 0,
   "account_id": "19857054769",
   "events": [...],
   "waypoints": [...],
-  "user_state": null,
-  "program_id": null,
   "summary": {...}
 }
 ```
